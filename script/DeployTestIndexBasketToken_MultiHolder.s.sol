@@ -70,7 +70,11 @@ contract DeployTestIndexBasketTokenMultiHolder is Script {
         token = vaultPortal.newTokenV6WithVault{value: buyAmount}(params);
     }
 
-    function _buildParams(uint256 buyAmount) internal view returns (IVaultPortalTypes.NewTokenV6WithVaultParams memory params) {
+    function _buildParams(uint256 buyAmount)
+        internal
+        view
+        returns (IVaultPortalTypes.NewTokenV6WithVaultParams memory params)
+    {
         params.name = "TestBasket2";
         params.symbol = "TBSK2";
         params.meta = "";
@@ -97,7 +101,13 @@ contract DeployTestIndexBasketTokenMultiHolder is Script {
         params.commissionReceiver = address(0);
         params.tokenVersion = IPortalTypes.TokenVersion.TOKEN_TAXED_V3;
         params.vaultFactory = VAULT_FACTORY;
-        params.vaultData = abi.encode(msg.sender, uint256(1), new address[](0), new uint16[](0)); // no initial basket - set via updateBasket() below (IBV-03 ABI change)
+        address[] memory initTokens = new address[](2);
+        initTokens[0] = CAKE_TESTNET;
+        initTokens[1] = BUSD_TESTNET;
+        uint16[] memory initWeights = new uint16[](2);
+        initWeights[0] = 6000;
+        initWeights[1] = 4000;
+        params.vaultData = abi.encode(msg.sender, uint256(1), initTokens, initWeights);
     }
 
     function _findVaultAddress(address token) internal view returns (address vaultAddr) {
@@ -124,18 +134,13 @@ contract DeployTestIndexBasketTokenMultiHolder is Script {
         console2.log("Both holders synced before dispatch.");
     }
 
-    function _setBasketAndDispatch(address token, address vaultAddr) internal {
-        IndexBasketVault vault = IndexBasketVault(payable(vaultAddr));
-
-        address[] memory tokens = new address[](2);
-        tokens[0] = CAKE_TESTNET;
-        tokens[1] = BUSD_TESTNET;
-        uint16[] memory weights = new uint16[](2);
-        weights[0] = 6000;
-        weights[1] = 4000;
-
-        vault.updateBasket(tokens, weights);
-        console2.log("Basket set.");
+    function _setBasketAndDispatch(
+        address token,
+        address /* vaultAddr */
+    )
+        internal
+    {
+        console2.log("Basket set at launch (required initial basket).");
 
         address taxProcessor = IFlapTaxTokenV3(token).taxProcessor();
         (bool okDispatch,) = taxProcessor.call(abi.encodeWithSignature("dispatch()"));

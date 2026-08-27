@@ -360,3 +360,25 @@ vm.stopPrank();
 vm.prank(user1);
 _sell(token, amount);
 ```
+
+## IndexBasketVault keeper (lazy shares)
+
+Custom Flap vaults do not receive a transfer hook on the tax token. Holder shares update only when `syncShare` / `claim` / `distributeTo` runs. A keeper should periodically refresh the holder list.
+
+1. Export current holders (BscScan token holders, or your indexer).
+2. Put addresses in JSON: `{ "holders": ["0x...", "0x..."] }` — see `script/holders.example.json`.
+3. Max 100 addresses per run (`MAX_DISTRIBUTE_BATCH`). Split larger lists.
+4. Never commit `.env` / private keys.
+
+```bash
+export VAULT=0x...
+export PRIVATE_KEY=0x...
+export HOLDERS_FILE=script/holders.example.json
+export DO_SYNC=true
+export DO_DISTRIBUTE=false
+export DO_PROCESS=true
+
+forge script script/SyncHolders.s.sol:SyncHolders --rpc-url $RPC --broadcast
+```
+
+This is not live pro-rata. Between keeper runs, sold tokens can still accrue and new buyers may not.
