@@ -861,15 +861,23 @@ contract IndexBasketVault is VaultBaseV3, AccessControl, ReentrancyGuard {
 contract IndexBasketVaultFactory is VaultFactoryBaseV2 {
     address public immutable pancakeRouter;
 
+    error WeightWithoutToken();
+    error TokenWithoutWeight();
+    error BasketRequired();
+
     constructor(address _pancakeRouter) {
         require(_pancakeRouter != address(0), "router required");
         require(IPancakeRouter(_pancakeRouter).WETH() != address(0), "router WETH missing");
         pancakeRouter = _pancakeRouter;
     }
 
-    /// @dev vaultData = abi.encode(address teamOperator, uint256 minimumShareBalance,
-    ///      address[] initialTokens, uint16[] initialWeights).
-    ///      initialTokens MUST be non-empty (required basket at birth).
+    /// @dev vaultData = abi.encode(
+    ///        address teamOperator, uint256 minimumShareBalance,
+    ///        address token1, address token2, address token3, address token4, address token5,
+    ///        uint16 weight1, uint16 weight2, uint16 weight3, uint16 weight4, uint16 weight5
+    ///      ). Unused slots are address(0) + weight 0. Used weights must sum to 10000.
+    ///      Five separate scalar fields so Flap.sh can render them (it cannot
+    ///      render nested address[] inside a tuple).
     function newVault(
         address taxToken,
         address quoteToken,
@@ -884,16 +892,56 @@ contract IndexBasketVaultFactory is VaultFactoryBaseV2 {
         require(msg.sender == _getVaultPortal(), "Only VaultPortal");
         require(quoteToken == address(0), "Only native BNB quote token supported");
 
-        (
-            address teamOperator,
-            uint256 minimumShareBalance,
-            address[] memory initialTokens,
-            uint16[] memory initialWeights
-        ) = abi.decode(vaultData, (address, uint256, address[], uint16[]));
+        (address teamOperator, uint256 minShare, address[] memory tokens, uint16[] memory weights) =
+            _decodeAndPackBasket(vaultData);
 
         IndexBasketVault v = new IndexBasketVault();
-        v.initializeVault(taxToken, pancakeRouter, teamOperator, minimumShareBalance, initialTokens, initialWeights);
+        v.initializeVault(taxToken, pancakeRouter, teamOperator, minShare, tokens, weights);
         vault = address(v);
+    }
+
+    /// @dev Flap.sh cannot render nested arrays in vaultData. Slots are five
+    ///      scalar token/weight pairs; unused = (address(0), 0).
+    function _decodeAndPackBasket(bytes calldata vaultData)
+        internal
+        pure
+        returns (address teamOperator, uint256 minShare, address[] memory tokens, uint16[] memory weights)
+    {
+        address t1;
+        address t2;
+        address t3;
+        address t4;
+        address t5;
+        uint16 w1;
+        uint16 w2;
+        uint16 w3;
+        uint16 w4;
+        uint16 w5;
+        (teamOperator, minShare, t1, t2, t3, t4, t5, w1, w2, w3, w4, w5) = abi.decode(
+            vaultData, (address, uint256, address, address, address, address, address, uint16, uint16, uint16, uint16, uint16)
+        );
+
+        address[5] memory ts = [t1, t2, t3, t4, t5];
+        uint16[5] memory ws = [w1, w2, w3, w4, w5];
+        uint256 n;
+        for (uint256 i; i < 5; i++) {
+            if (ts[i] == address(0)) {
+                if (ws[i] != 0) revert WeightWithoutToken();
+            } else {
+                if (ws[i] == 0) revert TokenWithoutWeight();
+                n++;
+            }
+        }
+        if (n == 0) revert BasketRequired();
+        tokens = new address[](n);
+        weights = new uint16[](n);
+        uint256 j;
+        for (uint256 i; i < 5; i++) {
+            if (ts[i] == address(0)) continue;
+            tokens[j] = ts[i];
+            weights[j] = ws[i];
+            j++;
+        }
     }
 
     function isQuoteTokenSupported(address quoteToken) external pure override returns (bool supported) {
@@ -907,15 +955,20 @@ contract IndexBasketVaultFactory is VaultFactoryBaseV2 {
     }
 
     function vaultDataSchema() public pure override returns (VaultDataSchema memory schema) {
-        schema.description =
-            "Creates an index-basket vault: pays holders dividends in a team-curated basket of up to 5 tokens. Initial basket is required.";
-        schema.fields = new FieldDescriptor[](4);
-        schema.fields[0] = FieldDescriptor("teamOperator", "address", "Address allowed to update the basket", 0);
-        schema.fields[1] =
-            FieldDescriptor("minimumShareBalance", "uint256", "Minimum token balance to be eligible for dividends", 18);
-        schema.fields[2] = FieldDescriptor("initialTokens", "address", "Required initial basket tokens (1-5)", 0);
-        schema.fields[3] =
-            FieldDescriptor("initialWeights", "uint16", "Matching weights in basis points, summing to 10000", 0);
+        schema.description = "";
+        schema.fields = new FieldDescriptor[](12);
+        schema.fields[0] = FieldDescriptor("teamOperator", "address", "", 0);
+        schema.fields[1] = FieldDescriptor("minimumShareBalance", "uint256", "", 18);
+        schema.fields[2] = FieldDescriptor("token1", "address", "", 0);
+        schema.fields[3] = FieldDescriptor("token2", "address", "", 0);
+        schema.fields[4] = FieldDescriptor("token3", "address", "", 0);
+        schema.fields[5] = FieldDescriptor("token4", "address", "", 0);
+        schema.fields[6] = FieldDescriptor("token5", "address", "", 0);
+        schema.fields[7] = FieldDescriptor("weight1", "uint16", "", 0);
+        schema.fields[8] = FieldDescriptor("weight2", "uint16", "", 0);
+        schema.fields[9] = FieldDescriptor("weight3", "uint16", "", 0);
+        schema.fields[10] = FieldDescriptor("weight4", "uint16", "", 0);
+        schema.fields[11] = FieldDescriptor("weight5", "uint16", "", 0);
         schema.isArray = false;
     }
 }

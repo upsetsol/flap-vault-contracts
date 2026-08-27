@@ -6,6 +6,7 @@ import {Test, console2} from "forge-std/Test.sol";
 import {IERC20} from "@openzeppelin/token/ERC20/IERC20.sol";
 
 import {IndexBasketVault, IndexBasketVaultFactory} from "src/IndexBasketVault.sol";
+import {FieldDescriptor} from "src/flap/IVaultSchemasV1.sol";
 
 /// @dev Minimal mock ERC20 standing in for a real Flap tax token — we only
 ///      need balanceOf() to drive the share math. Also exposes a settable
@@ -68,7 +69,17 @@ contract IndexBasketVaultTest is Test {
         address[] memory initTokens,
         uint16[] memory initWeights
     ) internal pure returns (bytes memory) {
-        return abi.encode(operator, minShare, initTokens, initWeights);
+        address t1 = initTokens.length > 0 ? initTokens[0] : address(0);
+        address t2 = initTokens.length > 1 ? initTokens[1] : address(0);
+        address t3 = initTokens.length > 2 ? initTokens[2] : address(0);
+        address t4 = initTokens.length > 3 ? initTokens[3] : address(0);
+        address t5 = initTokens.length > 4 ? initTokens[4] : address(0);
+        uint16 w1 = initWeights.length > 0 ? initWeights[0] : 0;
+        uint16 w2 = initWeights.length > 1 ? initWeights[1] : 0;
+        uint16 w3 = initWeights.length > 2 ? initWeights[2] : 0;
+        uint16 w4 = initWeights.length > 3 ? initWeights[3] : 0;
+        uint16 w5 = initWeights.length > 4 ? initWeights[4] : 0;
+        return abi.encode(operator, minShare, t1, t2, t3, t4, t5, w1, w2, w3, w4, w5);
     }
 
     function _twoTokenBasket() internal pure returns (address[] memory tokens, uint16[] memory weights) {
@@ -116,6 +127,15 @@ contract IndexBasketVaultTest is Test {
         assertEq(factory.factorySpecVersion(), "v2.3", "BOTH-11: factory should advertise v2.3 for V3 vaults");
     }
 
+    function test_factorySchemaExposesFiveTokenSlots() public view {
+        FieldDescriptor[] memory fields = factory.vaultDataSchema().fields;
+        assertEq(fields.length, 12);
+        assertEq(fields[2].name, "token1");
+        assertEq(fields[6].name, "token5");
+        assertEq(fields[7].name, "weight1");
+        assertEq(fields[11].name, "weight5");
+    }
+
     function test_teamOperatorDoesNotGetDefaultAdminRole() public view {
         assertFalse(vault.hasRole(vault.DEFAULT_ADMIN_ROLE(), TEAM_OPERATOR), "team must not hold DEFAULT_ADMIN_ROLE");
         assertTrue(vault.hasRole(vault.DEFAULT_ADMIN_ROLE(), GUARDIAN_BSC), "guardian must still hold admin");
@@ -141,7 +161,7 @@ contract IndexBasketVaultTest is Test {
     function test_factoryRejectsEmptyBasket() public {
         bytes memory vaultData = _encodeVaultData(TEAM_OPERATOR, 0, new address[](0), new uint16[](0));
         vm.prank(VAULT_PORTAL_BSC);
-        vm.expectRevert(IndexBasketVault.InvalidBasket.selector);
+        vm.expectRevert(IndexBasketVaultFactory.BasketRequired.selector);
         factory.newVault(address(taxToken), address(0), address(this), vaultData);
     }
 

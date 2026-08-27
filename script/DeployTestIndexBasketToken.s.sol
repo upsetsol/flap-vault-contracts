@@ -93,13 +93,20 @@ contract DeployTestIndexBasketToken is Script {
         params.commissionReceiver = address(0);
         params.tokenVersion = IPortalTypes.TokenVersion.TOKEN_TAXED_V3;
         params.vaultFactory = vm.envAddress("VAULT_FACTORY");
-        address[] memory initTokens = new address[](2);
-        initTokens[0] = CAKE_TESTNET;
-        initTokens[1] = BUSD_TESTNET;
-        uint16[] memory initWeights = new uint16[](2);
-        initWeights[0] = 6000;
-        initWeights[1] = 4000;
-        params.vaultData = abi.encode(msg.sender, uint256(1), initTokens, initWeights);
+        params.vaultData = abi.encode(
+            msg.sender,
+            uint256(1),
+            CAKE_TESTNET,
+            BUSD_TESTNET,
+            address(0),
+            address(0),
+            address(0),
+            uint16(6000),
+            uint16(4000),
+            uint16(0),
+            uint16(0),
+            uint16(0)
+        );
     }
 
     function _findVaultAddress(address token) internal view returns (address vaultAddr) {
