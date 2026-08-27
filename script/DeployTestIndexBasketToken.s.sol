@@ -18,8 +18,7 @@ contract DeployTestIndexBasketToken is Script {
     address internal constant PORTAL_TESTNET = 0x5bEacaF7ABCbB3aB280e80D007FD31fcE26510e9;
     address internal constant TAX_TOKEN_V3_IMPL_TESTNET = 0xE6Ff967a887084c16D0fD71548CF709542cc1557;
 
-    // Fill this in with your deployed IndexBasketVaultFactory address.
-    address internal constant VAULT_FACTORY = 0xaaE5bd958BEa8e086B6a63B67966314EF54EeaBA;
+    // Set VAULT_FACTORY in the environment to the factory just deployed.
 
     address internal constant CAKE_TESTNET = 0xFa60D973F7642B748046464e165A65B7323b0DEE;
     address internal constant BUSD_TESTNET = 0xeD24FC36d5Ee211Ea25A80239Fb8C4Cfd80f12Ee;
@@ -93,7 +92,7 @@ contract DeployTestIndexBasketToken is Script {
         params.dividendToken = address(0);
         params.commissionReceiver = address(0);
         params.tokenVersion = IPortalTypes.TokenVersion.TOKEN_TAXED_V3;
-        params.vaultFactory = VAULT_FACTORY;
+        params.vaultFactory = vm.envAddress("VAULT_FACTORY");
         address[] memory initTokens = new address[](2);
         initTokens[0] = CAKE_TESTNET;
         initTokens[1] = BUSD_TESTNET;
@@ -130,13 +129,12 @@ contract DeployTestIndexBasketToken is Script {
 
         vault.syncShare(me);
 
-        // Revenue that arrived via dispatch() before `me` was synced gets
-        // parked as native BNB rather than lost — see the earlier bugfix.
-        // Now that `me` is known, unstick it.
-        if (address(vaultAddr).balance > 0) {
-            vault.processPendingRevenue();
-            console2.log("Unstuck parked BNB via processPendingRevenue().");
-        }
+        // Do not call processPendingRevenue here: Foundry still fails the
+        // whole script if that tx reverts (try/catch does not help). A 0.02
+        // BNB creation buy is below the 0.03 BNB/slot threshold.
+        console2.log("Vault BNB:", address(vaultAddr).balance);
+        console2.log("minBnbToProcess:", vault.minBnbToProcess());
+        console2.log("totalPendingBnb:", vault.totalPendingBnb());
 
         uint256 pendingCake = vault.withdrawableDividendOf(me, CAKE_TESTNET);
         uint256 pendingBusd = vault.withdrawableDividendOf(me, BUSD_TESTNET);

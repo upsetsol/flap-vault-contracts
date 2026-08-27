@@ -27,6 +27,7 @@ interface IPancakeRouter {
     function WETH() external pure returns (address);
     function factory() external pure returns (address);
     function getAmountsOut(uint256 amountIn, address[] calldata path) external view returns (uint256[] memory amounts);
+    function getAmountsIn(uint256 amountOut, address[] calldata path) external view returns (uint256[] memory amounts);
 }
 
 interface IPancakeFactoryMinimal {
@@ -36,10 +37,15 @@ interface IPancakeFactoryMinimal {
 interface IPancakePairMinimal {
     function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
     function token0() external view returns (address);
+    function token1() external view returns (address);
 }
 
 interface ITaxTokenMainPool {
     function mainPool() external view returns (address);
+}
+
+interface IFlapQuotedToken {
+    function quoteToken() external view returns (address);
 }
 
 /// @title IndexBasketVault
@@ -76,8 +82,14 @@ interface ITaxTokenMainPool {
 ///          (Flap UI-01) and `autoForwardEnabled`/`forwardAddress` are NOT
 ///          addressed in this revision — tracked separately.
 ///      Follow-up: required initial basket; extra LP exclusion; fail-closed
-///      reserve cap; pending BNB of dropped basket tokens is not locked;
-///      operator knobs cannot lock processing; slippage ceiling is 5% (basket swap only).
+///      skip when no pair (BNB is not spent); pending BNB of dropped basket
+///      tokens is not locked; operator knobs cannot lock processing; slippage
+///      ceiling is 5% (basket swap only). Reserve-impact cap is opt-in
+///      (`maxReserveImpactBps == 0` default) so thin Flap quote pools are not sliced.
+///      Basket buys use Pancake V2: WBNB → token when that pair exists, otherwise
+///      WBNB → quote → token. Quote is auto-read from Flap `quoteToken()` / `mainPool`,
+///      or set by the operator via `setBasketQuote`. Two hops still use native BNB
+///      revenue; this is not an ERC20 vault quote.
 /// @dev Share sync model: a holder's share is refreshed to their current
 ///      taxToken balance at claim()/sync time, not on every transfer — this
 ///      vault cannot hook taxToken transfers (BOTH-05). Dividends are NOT a
@@ -96,7 +108,7 @@ contract IndexBasketVault is VaultBaseV3, AccessControl, ReentrancyGuard {
     uint256 private constant MAX_BASKET_SIZE = 5;
     uint16 private constant BPS_DENOMINATOR = 10000;
     uint16 private constant MAX_SLIPPAGE_BPS_CEILING = 500; // basket swap only; operator cannot widen MEV window
-    uint16 private constant MAX_RESERVE_IMPACT_BPS_CEILING = 200; // never allow >2% of WBNB reserves per swap
+    uint16 private constant MAX_RESERVE_IMPACT_BPS_CEILING = 200; // opt-in cap; 0 default = do not slice thin pools
     uint256 public constant MIN_BASKET_UPDATE_COOLDOWN = 1 hours;
     uint256 public constant MAX_BASKET_UPDATE_COOLDOWN = 7 days;
     uint256 public constant MAX_MIN_BNB_TO_PROCESS = 100 ether;
@@ -122,13 +134,18 @@ contract IndexBasketVault is VaultBaseV3, AccessControl, ReentrancyGuard {
 
     uint256 public minBnbToProcess = 0.03 ether; // per basket slot; skip dust swaps
     uint16 public maxSlippageBps = 500; // 5% default
-    uint16 public maxReserveImpactBps = 200; // 2% of WBNB pair reserve per swap, default
+    uint16 public maxReserveImpactBps = 0; // 0 = no size cap; 5% slippage still applies
 
     uint256 public lastBasketUpdateTime;
     uint256 public basketUpdateCooldown = MIN_BASKET_UPDATE_COOLDOWN;
 
     address[] public basketTokens;
     mapping(address => uint16) public basketWeightBps;
+    /// @notice Optional hop override per basket token. `address(0)` = auto
+    ///         (prefer a WBNB pair, else Flap `quoteToken()` / `mainPool`).
+    ///         Set to WBNB to force a direct pair. Any other address is the
+    ///         intermediate: BNB → hop → token.
+    mapping(address => address) public basketQuote;
 
     address[] public extraPairs;
     mapping(address => bool) public isExtraPair;
@@ -151,6 +168,7 @@ contract IndexBasketVault is VaultBaseV3, AccessControl, ReentrancyGuard {
     bool private initialized;
 
     event BasketUpdated(address[] tokens, uint16[] weightsBps);
+    event BasketQuoteSet(address indexed token, address indexed quote);
     event DividendsDeposited(address indexed token, uint256 bnbIn, uint256 tokenOut);
     event DividendClaimed(address indexed user, address indexed token, uint256 amount);
     event ShareSynced(address indexed user, uint256 newShare);
@@ -351,6 +369,10 @@ contract IndexBasketVault is VaultBaseV3, AccessControl, ReentrancyGuard {
         maxSlippageBps = bps;
     }
 
+    /// @notice Cap each swap to `bps` of the pair's WBNB (and hop-quote) reserve.
+    ///         `0` disables the cap so thin Flap pools are bought in full.
+    ///         Ceiling remains 2% — this cannot be used to widen a dump window
+    ///         beyond the old safety rail; it can only turn slicing off.
     function setMaxReserveImpactBps(uint16 bps) external onlyRole(OPERATOR_ROLE) {
         require(bps <= MAX_RESERVE_IMPACT_BPS_CEILING, "impact above safety ceiling");
         maxReserveImpactBps = bps;
@@ -359,6 +381,22 @@ contract IndexBasketVault is VaultBaseV3, AccessControl, ReentrancyGuard {
     function setMinBnbToProcess(uint256 amount) external onlyRole(OPERATOR_ROLE) {
         require(amount <= MAX_MIN_BNB_TO_PROCESS, "min BNB above maximum");
         minBnbToProcess = amount;
+    }
+
+    /// @notice Set or clear the Pancake hop used to buy `token`. Does not
+    ///         change basket membership. `quote == address(0)` restores auto
+    ///         routing; `quote == WBNB` forces a direct WBNB pair.
+    function setBasketQuote(address token, address quote) external onlyRole(OPERATOR_ROLE) {
+        if (token == address(0)) revert ZeroAddress();
+        address weth = IPancakeRouter(pancakeRouter).WETH();
+        if (quote != address(0) && quote != weth) {
+            if (
+                quote == token || quote == address(this) || quote == taxToken || quote == pancakeRouter
+                    || quote.code.length == 0
+            ) revert InvalidBasket();
+        }
+        basketQuote[token] = quote;
+        emit BasketQuoteSet(token, quote);
     }
 
     // ------------------------------------------------------------------
@@ -434,16 +472,11 @@ contract IndexBasketVault is VaultBaseV3, AccessControl, ReentrancyGuard {
 
     function _swapAndDeposit(address token, uint256 bnbAmount) internal returns (uint256 processed) {
         address weth = IPancakeRouter(pancakeRouter).WETH();
-
-        uint256 cappedAmount = _capAgainstReserves(token, weth, bnbAmount);
-        if (cappedAmount == 0) {
+        (address[] memory path, uint256 cappedAmount) = _buildPathAndCap(token, weth, bnbAmount);
+        if (cappedAmount == 0 || path.length < 2) {
             emit SwapSkipped(token, bnbAmount, "capped to zero (no/low liquidity)");
             return 0;
         }
-
-        address[] memory path = new address[](2);
-        path[0] = weth;
-        path[1] = token;
 
         uint256 minOut;
         try IPancakeRouter(pancakeRouter).getAmountsOut(cappedAmount, path) returns (uint256[] memory amounts) {
@@ -472,37 +505,126 @@ contract IndexBasketVault is VaultBaseV3, AccessControl, ReentrancyGuard {
         }
     }
 
-    /// @dev Caps a swap to at most `maxReserveImpactBps` of the target pair's
-    ///      WBNB reserve, to bound price impact / dump size (BOTH-07).
-    function _capAgainstReserves(address token, address weth, uint256 bnbAmount) internal view returns (uint256) {
+    /// @dev Direct path `[WBNB, token]` when that pair has reserves; otherwise
+    ///      `[WBNB, hop, token]` for Flap memes quoted in QQQB (or another ERC20).
+    function _buildPathAndCap(address token, address weth, uint256 bnbAmount)
+        internal
+        view
+        returns (address[] memory path, uint256 capped)
+    {
         address factory;
         try IPancakeRouter(pancakeRouter).factory() returns (address f) {
             factory = f;
         } catch {
-            return 0;
+            return (path, 0);
         }
 
-        address pair;
-        try IPancakeFactoryMinimal(factory).getPair(weth, token) returns (address p) {
+        address hop = _resolveHop(token, weth, factory);
+        if (hop == address(0)) {
+            path = new address[](2);
+            path[0] = weth;
+            path[1] = token;
+            capped = _capBnbByWethReserve(factory, weth, token, bnbAmount);
+            return (path, capped);
+        }
+
+        path = new address[](3);
+        path[0] = weth;
+        path[1] = hop;
+        path[2] = token;
+        capped = _capBnbByWethReserve(factory, weth, hop, bnbAmount);
+        if (capped == 0) return (path, 0);
+        capped = _capBnbByHopReserve(factory, weth, hop, token, capped);
+    }
+
+    /// @dev `address(0)` means buy on the WBNB pair. Non-zero is the intermediate.
+    function _resolveHop(address token, address weth, address factory) internal view returns (address hop) {
+        address overrideQuote = basketQuote[token];
+        if (overrideQuote != address(0)) {
+            return overrideQuote == weth ? address(0) : overrideQuote;
+        }
+
+        if (_tokenReserve(_getPair(factory, weth, token), weth) > 0) {
+            return address(0);
+        }
+
+        hop = _inferQuote(token);
+        if (hop == address(0) || hop == weth || hop == token || hop == taxToken || hop == address(this)) {
+            return address(0);
+        }
+    }
+
+    function _inferQuote(address token) internal view returns (address quote) {
+        try IFlapQuotedToken(token).quoteToken() returns (address q) {
+            if (q != address(0) && q != token) return q;
+        } catch {}
+
+        try ITaxTokenMainPool(token).mainPool() returns (address pool) {
+            if (pool == address(0) || pool.code.length == 0) return address(0);
+            try IPancakePairMinimal(pool).token0() returns (address t0) {
+                try IPancakePairMinimal(pool).token1() returns (address t1) {
+                    if (t0 == token) return t1;
+                    if (t1 == token) return t0;
+                } catch {}
+            } catch {}
+        } catch {}
+    }
+
+    function _capBnbByWethReserve(address factory, address weth, address other, uint256 bnbAmount)
+        internal
+        view
+        returns (uint256)
+    {
+        uint256 wethReserve = _tokenReserve(_getPair(factory, weth, other), weth);
+        if (wethReserve == 0) return 0;
+        if (maxReserveImpactBps == 0) return bnbAmount;
+        uint256 cap = (wethReserve * maxReserveImpactBps) / BPS_DENOMINATOR;
+        return bnbAmount > cap ? cap : bnbAmount;
+    }
+
+    /// @dev When `maxReserveImpactBps > 0`, also bound the second hop to that
+    ///      fraction of the quote sitting in the meme pair. `0` skips slicing.
+    function _capBnbByHopReserve(address factory, address weth, address hop, address token, uint256 bnbAmount)
+        internal
+        view
+        returns (uint256)
+    {
+        uint256 hopReserve = _tokenReserve(_getPair(factory, hop, token), hop);
+        if (hopReserve == 0) return 0;
+        if (maxReserveImpactBps == 0) return bnbAmount;
+        uint256 maxHop = (hopReserve * maxReserveImpactBps) / BPS_DENOMINATOR;
+        if (maxHop == 0) return 0;
+
+        address[] memory p = new address[](2);
+        p[0] = weth;
+        p[1] = hop;
+        try IPancakeRouter(pancakeRouter).getAmountsIn(maxHop, p) returns (uint256[] memory amounts) {
+            uint256 need = amounts[0];
+            return need < bnbAmount ? need : bnbAmount;
+        } catch {
+            return 0;
+        }
+    }
+
+    function _getPair(address factory, address a, address b) internal view returns (address pair) {
+        try IPancakeFactoryMinimal(factory).getPair(a, b) returns (address p) {
             pair = p;
         } catch {
-            return 0;
+            pair = address(0);
         }
-        if (pair == address(0)) return 0;
+    }
 
+    function _tokenReserve(address pair, address token) internal view returns (uint256) {
+        if (pair == address(0) || token == address(0)) return 0;
         try IPancakePairMinimal(pair).getReserves() returns (uint112 r0, uint112 r1, uint32) {
-            address token0;
             try IPancakePairMinimal(pair).token0() returns (address t0) {
-                token0 = t0;
-            } catch {
-                return 0;
-            }
-            uint256 wethReserve = token0 == weth ? uint256(r0) : uint256(r1);
-            uint256 cap = (wethReserve * maxReserveImpactBps) / BPS_DENOMINATOR;
-            return bnbAmount > cap ? cap : bnbAmount;
-        } catch {
-            return 0;
-        }
+                if (t0 == token) return uint256(r0);
+                try IPancakePairMinimal(pair).token1() returns (address t1) {
+                    if (t1 == token) return uint256(r1);
+                } catch {}
+            } catch {}
+        } catch {}
+        return 0;
     }
 
     // ------------------------------------------------------------------

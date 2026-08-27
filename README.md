@@ -365,6 +365,16 @@ _sell(token, amount);
 
 Custom Flap vaults do not receive a transfer hook on the tax token. Holder shares update only when `syncShare` / `claim` / `distributeTo` runs. A keeper should periodically refresh the holder list.
 
+Basket tokens do not need a WBNB pair. If the token is a Flap meme quoted in QQQB (or another ERC20), the vault buys `BNB → quote → token` on Pancake V2. Override a hop with `setBasketQuote(token, quote)`; `address(0)` is auto. Thin quote pools are bought in full by default (`maxReserveImpactBps = 0`); 5% swap slippage still applies.
+
+**Basket buy cron** (not SyncHolders): `script/process-basket-keeper.sh` calls `processPendingRevenue` only when some slot is ≥ `minBnbToProcess` (default **0.03 BNB per basket token**, so a 5-token equal basket needs ~0.15 BNB total). The script is free; each successful tx pays BSC gas from a small hot wallet (the function is public — that key is not the operator). Copy `script/keeper.env.example` to `~/.vault-keeper.env` (`chmod 600`), then `crontab -e`:
+
+```
+*/5 * * * * /bin/bash -lc 'export PATH="$HOME/.foundry/bin:$PATH"; set -a; source "$HOME/.vault-keeper.env"; set +a; /ABSOLUTE/PATH/flap-vault-contracts/script/process-basket-keeper.sh >> "$HOME/vault-keeper.log" 2>&1'
+```
+
+Mac must be awake. A cheap VPS is the same cron if you want 24/7.
+
 1. Export current holders (BscScan token holders, or your indexer).
 2. Put addresses in JSON: `{ "holders": ["0x...", "0x..."] }` — see `script/holders.example.json`.
 3. Max 100 addresses per run (`MAX_DISTRIBUTE_BATCH`). Split larger lists.

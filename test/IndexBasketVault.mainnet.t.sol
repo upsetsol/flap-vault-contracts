@@ -34,6 +34,9 @@ contract IndexBasketVaultTest is Test {
     address internal constant USER1 = address(0xCAFE1);
     address internal constant USER2 = address(0xCAFE2);
     address internal constant ATTACKER = address(0xBAD1);
+    address internal constant QQQB = 0x205812CdBed920aFf76C6580abD681a46D11efc7;
+    address internal constant WECHAT_DOGE = 0x016c87c9986FB6c069846A799042a2327cF07777;
+    address internal constant JACKET = 0xb82535E74B03FFE4910EFeA1C759b6bbbF0a7777;
 
     IndexBasketVaultFactory internal factory;
     IndexBasketVault internal vault;
@@ -100,6 +103,7 @@ contract IndexBasketVaultTest is Test {
         assertTrue(vault.hasRole(vault.OPERATOR_ROLE(), TEAM_OPERATOR));
         assertEq(vault.vaultQuoteToken(), address(0), "native-only vault");
         assertEq(vault.minBnbToProcess(), 0.03 ether);
+        assertEq(vault.maxReserveImpactBps(), 0, "thin Flap pools must not be sliced by default");
     }
 
     function test_factoryRejectsNonVaultPortalCaller() public {
@@ -1002,6 +1006,105 @@ contract IndexBasketVaultTest is Test {
 
         assertEq(vault.pendingBnbByToken(address(deadToken)), 1 ether, "fail-closed cap must leave BNB pending");
         assertEq(address(vault).balance, 1 ether, "BNB must not be spent when pair/reserves are missing");
+    }
+
+    // ------------------------------------------------------------------
+    // Quote-token hops (Flap memes that trade against QQQB, not WBNB)
+    // ------------------------------------------------------------------
+    function test_nonOperatorCannotSetBasketQuote() public {
+        vm.prank(ATTACKER);
+        vm.expectRevert();
+        vault.setBasketQuote(CAKE, USDT);
+    }
+
+    function test_setBasketQuoteRejectsTaxTokenAsHop() public {
+        vm.prank(TEAM_OPERATOR);
+        vm.expectRevert(IndexBasketVault.InvalidBasket.selector);
+        vault.setBasketQuote(CAKE, address(taxToken));
+    }
+
+    function test_forcedUsdtHopStillBuysCake() public {
+        vm.prank(TEAM_OPERATOR);
+        vault.setBasketQuote(CAKE, USDT);
+        assertEq(vault.basketQuote(CAKE), USDT);
+
+        taxToken.mint(USER1, 100 ether);
+        vault.syncShare(USER1);
+        _fundAndProcess(1 ether);
+
+        assertGt(vault.withdrawableDividendOf(USER1, CAKE), 0, "CAKE should be bought via WBNB -> USDT -> CAKE");
+        assertGt(vault.withdrawableDividendOf(USER1, USDT), 0, "USDT direct hop must still work");
+    }
+
+    function test_flapQuotedMemeIsBoughtViaQuoteToken() public {
+        address[] memory tokens = new address[](1);
+        tokens[0] = WECHAT_DOGE;
+        uint16[] memory weights = new uint16[](1);
+        weights[0] = 10000;
+
+        _skipBasketCooldown();
+        vm.prank(TEAM_OPERATOR);
+        vault.updateBasket(tokens, weights);
+
+        taxToken.mint(USER1, 100 ether);
+        vault.syncShare(USER1);
+
+        uint256 qqqbBefore = IERC20(QQQB).balanceOf(address(vault));
+        _fundAndProcess(0.05 ether);
+
+        assertGt(
+            vault.withdrawableDividendOf(USER1, WECHAT_DOGE),
+            0,
+            "Flap meme quoted in QQQB must be bought via WBNB -> QQQB -> token"
+        );
+        assertEq(IERC20(QQQB).balanceOf(address(vault)), qqqbBefore, "hop must be atomic; no leftover QQQB in the vault");
+    }
+
+    function test_thinQuotedMemeSpendsFullPending() public {
+        address[] memory tokens = new address[](1);
+        tokens[0] = JACKET;
+        uint16[] memory weights = new uint16[](1);
+        weights[0] = 10000;
+
+        _skipBasketCooldown();
+        vm.prank(TEAM_OPERATOR);
+        vault.updateBasket(tokens, weights);
+
+        taxToken.mint(USER1, 100 ether);
+        vault.syncShare(USER1);
+
+        // 0.1 BNB is well above 2% of Jacket's quote/WBNB pool (~0.055). The
+        // old cap would slice; with the cap off the full pending must spend.
+        _fundAndProcess(0.1 ether);
+
+        assertGt(vault.withdrawableDividendOf(USER1, JACKET), 0, "thin quote pool must still be bought");
+        assertEq(vault.pendingBnbByToken(JACKET), 0, "full pending must be spent, not sliced");
+        assertEq(address(vault).balance, 0, "no leftover BNB parked by a reserve cap");
+    }
+
+    function test_optInReserveCapSkipsThinPool() public {
+        address[] memory tokens = new address[](1);
+        tokens[0] = JACKET;
+        uint16[] memory weights = new uint16[](1);
+        weights[0] = 10000;
+
+        _skipBasketCooldown();
+        vm.startPrank(TEAM_OPERATOR);
+        vault.updateBasket(tokens, weights);
+        vault.setMaxReserveImpactBps(200);
+        vm.stopPrank();
+
+        taxToken.mint(USER1, 100 ether);
+        vault.syncShare(USER1);
+
+        vm.deal(address(this), 0.1 ether);
+        (bool ok,) = address(vault).call{value: 0.1 ether}("");
+        assertTrue(ok);
+        vault.processPendingRevenue();
+
+        assertEq(vault.withdrawableDividendOf(USER1, JACKET), 0, "2% cap should skip a too-thin quote pool rather than slice a dust buy");
+        assertEq(vault.pendingBnbByToken(JACKET), 0.1 ether, "BNB must stay queued when the opt-in cap collapses the swap");
+        assertEq(address(vault).balance, 0.1 ether);
     }
 }
 
