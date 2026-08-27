@@ -77,6 +77,7 @@ contract CustomDividendVaultTest is Test {
         assertEq(vault.dividendToken(), CAKE, "dividendToken mismatch");
         assertEq(vault.pancakeRouter(), PANCAKE_ROUTER_V2, "router mismatch");
         assertEq(vault.vaultQuoteToken(), address(0), "native-only vault");
+        assertEq(vault.minBnbToProcess(), 0.03 ether);
     }
 
     function test_factorySpecVersionIsV23() public view {
@@ -137,7 +138,9 @@ contract CustomDividendVaultTest is Test {
 
         vault.processPendingRevenue();
         assertEq(vault.pendingBnb(), 0, "parked BNB should now be converted");
-        assertGt(vault.withdrawableDividendOf(USER1), 0, "USER1 should now be able to claim the previously-parked funds");
+        assertGt(
+            vault.withdrawableDividendOf(USER1), 0, "USER1 should now be able to claim the previously-parked funds"
+        );
     }
 
     function test_processPendingRevenueRevertsWithNothingPending() public {
@@ -328,7 +331,7 @@ contract CustomDividendVaultTest is Test {
     function test_operatorCannotExceedSlippageCeiling() public {
         vm.prank(GUARDIAN_BSC);
         vm.expectRevert(bytes("slippage above safety ceiling"));
-        vault.setMaxSlippageBps(2001);
+        vault.setMaxSlippageBps(501);
     }
 
     function test_swapStillSucceedsWithDefaultSlippageProtection() public {
@@ -337,4 +340,27 @@ contract CustomDividendVaultTest is Test {
         _fundAndProcess(1 ether);
         assertGt(vault.withdrawableDividendOf(USER1), 0, "swap should still succeed with slippage protection on");
     }
+
+    function test_factoryRejectsDividendTokenWithoutWbnbPair() public {
+        NoLiqDividendToken junk = new NoLiqDividendToken();
+        bytes memory vaultData = abi.encode(address(junk), uint256(0));
+        vm.prank(VAULT_PORTAL_BSC);
+        vm.expectRevert(bytes("no WBNB pair"));
+        factory.newVault(address(taxToken), address(0), address(this), vaultData);
+    }
+
+    function test_extraPairNeverAccrues() public {
+        address extra = address(uint160(uint256(keccak256("cdv-extra-pair"))));
+        vm.etch(extra, hex"00");
+        taxToken.mint(extra, 999 ether);
+        vm.prank(GUARDIAN_BSC);
+        vault.addExtraPair(extra);
+        vault.syncShare(extra);
+        assertEq(vault.totalEligibleSupply(), 0);
+    }
+}
+
+contract NoLiqDividendToken {
+    uint256 public totalSupply = 1;
+    mapping(address => uint256) public balanceOf;
 }

@@ -51,21 +51,20 @@ contract IndexBasketVaultTest is Test {
         taxToken = new MockTaxToken();
         factory = new IndexBasketVaultFactory(PANCAKE_ROUTER_V2);
 
-        // No initial basket by default — most tests set one explicitly via
-        // updateBasket(). Tests validating IBV-03 (initial-basket-at-birth)
-        // deploy their own vault instance directly instead of using this one.
-        bytes memory vaultData = _encodeVaultData(TEAM_OPERATOR, 0, new address[](0), new uint16[](0));
+        (address[] memory initTokens, uint16[] memory initWeights) = _twoTokenBasket();
+        bytes memory vaultData = _encodeVaultData(TEAM_OPERATOR, 0, initTokens, initWeights);
 
         vm.prank(VAULT_PORTAL_BSC);
         address vaultAddr = factory.newVault(address(taxToken), address(0), address(this), vaultData);
         vault = IndexBasketVault(payable(vaultAddr));
     }
 
-    function _encodeVaultData(address operator, uint256 minShare, address[] memory initTokens, uint16[] memory initWeights)
-        internal
-        pure
-        returns (bytes memory)
-    {
+    function _encodeVaultData(
+        address operator,
+        uint256 minShare,
+        address[] memory initTokens,
+        uint16[] memory initWeights
+    ) internal pure returns (bytes memory) {
         return abi.encode(operator, minShare, initTokens, initWeights);
     }
 
@@ -100,6 +99,7 @@ contract IndexBasketVaultTest is Test {
         assertEq(vault.pancakeRouter(), PANCAKE_ROUTER_V2);
         assertTrue(vault.hasRole(vault.OPERATOR_ROLE(), TEAM_OPERATOR));
         assertEq(vault.vaultQuoteToken(), address(0), "native-only vault");
+        assertEq(vault.minBnbToProcess(), 0.03 ether);
     }
 
     function test_factoryRejectsNonVaultPortalCaller() public {
@@ -134,9 +134,11 @@ contract IndexBasketVaultTest is Test {
         assertEq(v2.basketWeightBps(CAKE), 6000);
     }
 
-    function test_vaultLaunchesWithEmptyBasketIfNoneProvided() public view {
-        // Default setUp() passes empty arrays — confirms that path still works.
-        assertEq(vault.basketLength(), 0);
+    function test_factoryRejectsEmptyBasket() public {
+        bytes memory vaultData = _encodeVaultData(TEAM_OPERATOR, 0, new address[](0), new uint16[](0));
+        vm.prank(VAULT_PORTAL_BSC);
+        vm.expectRevert(IndexBasketVault.InvalidBasket.selector);
+        factory.newVault(address(taxToken), address(0), address(this), vaultData);
     }
 
     // ------------------------------------------------------------------
@@ -144,6 +146,7 @@ contract IndexBasketVaultTest is Test {
     // ------------------------------------------------------------------
     function test_updateBasketRejectsRapidSecondCall() public {
         (address[] memory tokens, uint16[] memory weights) = _twoTokenBasket();
+        _skipBasketCooldown();
         vm.prank(TEAM_OPERATOR);
         vault.updateBasket(tokens, weights);
 
@@ -159,6 +162,7 @@ contract IndexBasketVaultTest is Test {
 
     function test_updateBasketSucceedsAfterCooldownElapses() public {
         (address[] memory tokens, uint16[] memory weights) = _twoTokenBasket();
+        _skipBasketCooldown();
         vm.prank(TEAM_OPERATOR);
         vault.updateBasket(tokens, weights);
 
@@ -169,6 +173,7 @@ contract IndexBasketVaultTest is Test {
         uint16[] memory newWeights = new uint16[](1);
         newWeights[0] = 10000;
 
+        _skipBasketCooldown();
         vm.prank(TEAM_OPERATOR);
         vault.updateBasket(newTokens, newWeights); // must not revert
         assertEq(vault.basketLength(), 1);
@@ -192,6 +197,7 @@ contract IndexBasketVaultTest is Test {
     function test_operatorCanSetBasket() public {
         (address[] memory tokens, uint16[] memory weights) = _twoTokenBasket();
 
+        _skipBasketCooldown();
         vm.prank(TEAM_OPERATOR);
         vault.updateBasket(tokens, weights);
 
@@ -217,6 +223,7 @@ contract IndexBasketVaultTest is Test {
         weights[0] = 5000;
         weights[1] = 4000;
 
+        _skipBasketCooldown();
         vm.prank(TEAM_OPERATOR);
         vm.expectRevert(IndexBasketVault.InvalidBasket.selector);
         vault.updateBasket(tokens, weights);
@@ -230,6 +237,7 @@ contract IndexBasketVaultTest is Test {
         weights[0] = 5000;
         weights[1] = 5000;
 
+        _skipBasketCooldown();
         vm.prank(TEAM_OPERATOR);
         vm.expectRevert(IndexBasketVault.InvalidBasket.selector);
         vault.updateBasket(tokens, weights);
@@ -244,6 +252,7 @@ contract IndexBasketVaultTest is Test {
             weights[i] = evenWeight;
         }
 
+        _skipBasketCooldown();
         vm.prank(TEAM_OPERATOR);
         vm.expectRevert(IndexBasketVault.InvalidBasket.selector);
         vault.updateBasket(tokens, weights);
@@ -255,6 +264,7 @@ contract IndexBasketVaultTest is Test {
         uint16[] memory weights = new uint16[](1);
         weights[0] = 10000;
 
+        _skipBasketCooldown();
         vm.prank(TEAM_OPERATOR);
         vm.expectRevert(IndexBasketVault.InvalidBasket.selector);
         vault.updateBasket(tokens, weights);
@@ -266,6 +276,7 @@ contract IndexBasketVaultTest is Test {
         uint16[] memory weights = new uint16[](1);
         weights[0] = 10000;
 
+        _skipBasketCooldown();
         vm.prank(TEAM_OPERATOR);
         vm.expectRevert(IndexBasketVault.InvalidBasket.selector);
         vault.updateBasket(tokens, weights);
@@ -279,6 +290,7 @@ contract IndexBasketVaultTest is Test {
         weights[0] = 0;
         weights[1] = 10000;
 
+        _skipBasketCooldown();
         vm.prank(TEAM_OPERATOR);
         vm.expectRevert(IndexBasketVault.InvalidBasket.selector);
         vault.updateBasket(tokens, weights);
@@ -289,6 +301,7 @@ contract IndexBasketVaultTest is Test {
     // ------------------------------------------------------------------
     function test_receiveOnlyAccumulatesNeverSwaps() public {
         (address[] memory tokens, uint16[] memory weights) = _twoTokenBasket();
+        _skipBasketCooldown();
         vm.prank(TEAM_OPERATOR);
         vault.updateBasket(tokens, weights);
 
@@ -306,11 +319,12 @@ contract IndexBasketVaultTest is Test {
     }
 
     function test_receiveWithNoBasketParksInNoBasketBucket() public view {
-        assertEq(vault.basketLength(), 0);
+        assertEq(vault.basketLength(), 2, "setUp must deploy with a required initial basket");
     }
 
     function test_processPendingRevenueSwapsAcrossBasketProportionally() public {
         (address[] memory tokens, uint16[] memory weights) = _twoTokenBasket();
+        _skipBasketCooldown();
         vm.prank(TEAM_OPERATOR);
         vault.updateBasket(tokens, weights);
 
@@ -344,6 +358,7 @@ contract IndexBasketVaultTest is Test {
         weights[0] = 5000;
         weights[1] = 5000;
 
+        _skipBasketCooldown();
         vm.prank(TEAM_OPERATOR);
         vault.updateBasket(tokens, weights);
 
@@ -381,6 +396,7 @@ contract IndexBasketVaultTest is Test {
     // ------------------------------------------------------------------
     function test_holderCanClaimAllAcrossBothTokens() public {
         (address[] memory tokens, uint16[] memory weights) = _twoTokenBasket();
+        _skipBasketCooldown();
         vm.prank(TEAM_OPERATOR);
         vault.updateBasket(tokens, weights);
 
@@ -405,6 +421,7 @@ contract IndexBasketVaultTest is Test {
 
     function test_claimAllRevertsWithNothingToClaim() public {
         (address[] memory tokens, uint16[] memory weights) = _twoTokenBasket();
+        _skipBasketCooldown();
         vm.prank(TEAM_OPERATOR);
         vault.updateBasket(tokens, weights);
 
@@ -420,6 +437,7 @@ contract IndexBasketVaultTest is Test {
     // ------------------------------------------------------------------
     function test_distributeToPaysMultipleHolders() public {
         (address[] memory tokens, uint16[] memory weights) = _twoTokenBasket();
+        _skipBasketCooldown();
         vm.prank(TEAM_OPERATOR);
         vault.updateBasket(tokens, weights);
 
@@ -443,6 +461,7 @@ contract IndexBasketVaultTest is Test {
 
     function test_distributeToDoesNotRevertOnUserWithNothingPending() public {
         (address[] memory tokens, uint16[] memory weights) = _twoTokenBasket();
+        _skipBasketCooldown();
         vm.prank(TEAM_OPERATOR);
         vault.updateBasket(tokens, weights);
 
@@ -465,6 +484,7 @@ contract IndexBasketVaultTest is Test {
     // ------------------------------------------------------------------
     function test_changingBasketPreservesOldAccruals() public {
         (address[] memory tokens, uint16[] memory weights) = _twoTokenBasket();
+        _skipBasketCooldown();
         vm.prank(TEAM_OPERATOR);
         vault.updateBasket(tokens, weights);
 
@@ -483,6 +503,7 @@ contract IndexBasketVaultTest is Test {
         uint16[] memory newWeights = new uint16[](1);
         newWeights[0] = 10000;
 
+        _skipBasketCooldown();
         vm.prank(TEAM_OPERATOR);
         vault.updateBasket(newTokens, newWeights);
 
@@ -527,6 +548,7 @@ contract IndexBasketVaultTest is Test {
 
     function test_guardianCannotWithdrawPendingBnb() public {
         (address[] memory tokens, uint16[] memory weights) = _twoTokenBasket();
+        _skipBasketCooldown();
         vm.prank(TEAM_OPERATOR);
         vault.updateBasket(tokens, weights);
 
@@ -542,6 +564,7 @@ contract IndexBasketVaultTest is Test {
 
     function test_guardianCannotWithdrawReservedDividends() public {
         (address[] memory tokens, uint16[] memory weights) = _twoTokenBasket();
+        _skipBasketCooldown();
         vm.prank(TEAM_OPERATOR);
         vault.updateBasket(tokens, weights);
 
@@ -584,6 +607,7 @@ contract IndexBasketVaultTest is Test {
         weights[3] = 2000;
         weights[4] = 2000;
 
+        _skipBasketCooldown();
         vm.prank(TEAM_OPERATOR);
         vault.updateBasket(tokens, weights);
         assertEq(vault.basketLength(), 5);
@@ -617,6 +641,7 @@ contract IndexBasketVaultTest is Test {
         weights[0] = 5000;
         weights[1] = 5000;
 
+        _skipBasketCooldown();
         vm.prank(TEAM_OPERATOR);
         vault.updateBasket(tokens, weights);
 
@@ -628,7 +653,7 @@ contract IndexBasketVaultTest is Test {
         assertTrue(ok);
 
         vm.expectEmit(true, false, false, false);
-        emit IndexBasketVault.SwapFailed(address(deadToken), 0);
+        emit IndexBasketVault.SwapSkipped(address(deadToken), 0, "");
         vault.processPendingRevenue();
 
         assertGt(vault.withdrawableDividendOf(USER1, CAKE), 0, "CAKE side should still work");
@@ -641,6 +666,7 @@ contract IndexBasketVaultTest is Test {
     // ------------------------------------------------------------------
     function test_partialBasketOverlapKeepsAccruingSharedToken() public {
         (address[] memory tokens, uint16[] memory weights) = _twoTokenBasket();
+        _skipBasketCooldown();
         vm.prank(TEAM_OPERATOR);
         vault.updateBasket(tokens, weights);
 
@@ -659,6 +685,7 @@ contract IndexBasketVaultTest is Test {
         uint16[] memory newWeights = new uint16[](1);
         newWeights[0] = 10000;
 
+        _skipBasketCooldown();
         vm.prank(TEAM_OPERATOR);
         vault.updateBasket(newTokens, newWeights);
 
@@ -676,17 +703,14 @@ contract IndexBasketVaultTest is Test {
     // 11. minimumShareBalance actually gates small holders to zero share
     // ------------------------------------------------------------------
     function test_minimumShareBalanceExcludesSmallHolders() public {
-        bytes memory vaultData = _encodeVaultData(TEAM_OPERATOR, 10000 ether, new address[](0), new uint16[](0));
-        vm.prank(VAULT_PORTAL_BSC);
-        address vaultAddr2 = factory.newVault(address(taxToken), address(0), address(this), vaultData);
-        IndexBasketVault vaultWithMin = IndexBasketVault(payable(vaultAddr2));
-
         address[] memory tokens = new address[](1);
         tokens[0] = CAKE;
         uint16[] memory weights = new uint16[](1);
         weights[0] = 10000;
-        vm.prank(TEAM_OPERATOR);
-        vaultWithMin.updateBasket(tokens, weights);
+        bytes memory vaultData = _encodeVaultData(TEAM_OPERATOR, 10000 ether, tokens, weights);
+        vm.prank(VAULT_PORTAL_BSC);
+        address vaultAddr2 = factory.newVault(address(taxToken), address(0), address(this), vaultData);
+        IndexBasketVault vaultWithMin = IndexBasketVault(payable(vaultAddr2));
 
         taxToken.mint(USER1, 5000 ether);
         taxToken.mint(USER2, 20000 ether);
@@ -708,6 +732,7 @@ contract IndexBasketVaultTest is Test {
     // ------------------------------------------------------------------
     function test_excludedAddressNeverAccrues() public {
         (address[] memory tokens, uint16[] memory weights) = _twoTokenBasket();
+        _skipBasketCooldown();
         vm.prank(TEAM_OPERATOR);
         vault.updateBasket(tokens, weights);
 
@@ -798,6 +823,7 @@ contract IndexBasketVaultTest is Test {
     // ------------------------------------------------------------------
     function test_gasCostOfDistributingToThreeHundredHolders() public {
         (address[] memory tokens, uint16[] memory weights) = _twoTokenBasket();
+        _skipBasketCooldown();
         vm.prank(TEAM_OPERATOR);
         vault.updateBasket(tokens, weights);
 
@@ -836,6 +862,7 @@ contract IndexBasketVaultTest is Test {
     // ------------------------------------------------------------------
     function test_revenueBeforeAnySyncIsParkedNotLost() public {
         (address[] memory tokens, uint16[] memory weights) = _twoTokenBasket();
+        _skipBasketCooldown();
         vm.prank(TEAM_OPERATOR);
         vault.updateBasket(tokens, weights);
 
@@ -850,11 +877,16 @@ contract IndexBasketVaultTest is Test {
 
         vault.processPendingRevenue();
         assertEq(vault.totalPendingBnb(), 0, "parked BNB should now be converted");
-        assertGt(vault.withdrawableDividendOf(USER1, CAKE), 0, "USER1 should now be able to claim the previously-parked funds");
+        assertGt(
+            vault.withdrawableDividendOf(USER1, CAKE),
+            0,
+            "USER1 should now be able to claim the previously-parked funds"
+        );
     }
 
     function test_processPendingRevenueRevertsWithNothingPending() public {
         (address[] memory tokens, uint16[] memory weights) = _twoTokenBasket();
+        _skipBasketCooldown();
         vm.prank(TEAM_OPERATOR);
         vault.updateBasket(tokens, weights);
 
@@ -870,24 +902,25 @@ contract IndexBasketVaultTest is Test {
     // ------------------------------------------------------------------
     function test_operatorCanTuneSlippageWithinCeiling() public {
         vm.prank(TEAM_OPERATOR);
-        vault.setMaxSlippageBps(1000);
-        assertEq(vault.maxSlippageBps(), 1000);
+        vault.setMaxSlippageBps(300);
+        assertEq(vault.maxSlippageBps(), 300);
     }
 
     function test_operatorCannotExceedSlippageCeiling() public {
         vm.prank(TEAM_OPERATOR);
         vm.expectRevert(bytes("slippage above safety ceiling"));
-        vault.setMaxSlippageBps(2001);
+        vault.setMaxSlippageBps(501);
     }
 
     function test_operatorCannotExceedReserveImpactCeiling() public {
         vm.prank(TEAM_OPERATOR);
         vm.expectRevert(bytes("impact above safety ceiling"));
-        vault.setMaxReserveImpactBps(1001);
+        vault.setMaxReserveImpactBps(201);
     }
 
     function test_swapStillSucceedsWithDefaultSlippageProtection() public {
         (address[] memory tokens, uint16[] memory weights) = _twoTokenBasket();
+        _skipBasketCooldown();
         vm.prank(TEAM_OPERATOR);
         vault.updateBasket(tokens, weights);
 
@@ -896,6 +929,79 @@ contract IndexBasketVaultTest is Test {
 
         _fundAndProcess(1 ether);
         assertGt(vault.withdrawableDividendOf(USER1, CAKE), 0, "swap should still succeed with slippage protection on");
+    }
+
+    function test_extraPairNeverAccrues() public {
+        address extra = address(uint160(uint256(keccak256("extra-pair"))));
+        vm.etch(extra, hex"00");
+        taxToken.mint(extra, 999 ether);
+
+        vm.prank(TEAM_OPERATOR);
+        vault.addExtraPair(extra);
+
+        vault.syncShare(extra);
+        assertEq(vault.totalEligibleSupply(), 0, "extra pair must be excluded from dividends");
+    }
+
+    function test_droppedBasketTokenPendingMovesToNoBasketBucket() public {
+        taxToken.mint(USER1, 100 ether);
+        vault.syncShare(USER1);
+
+        vm.deal(address(this), 1 ether);
+        (bool ok,) = address(vault).call{value: 1 ether}("");
+        assertTrue(ok);
+        assertEq(vault.pendingBnbByToken(USDT), 0.4 ether);
+
+        address[] memory newTokens = new address[](1);
+        newTokens[0] = CAKE;
+        uint16[] memory newWeights = new uint16[](1);
+        newWeights[0] = 10000;
+        _skipBasketCooldown();
+        vm.prank(TEAM_OPERATOR);
+        vault.updateBasket(newTokens, newWeights);
+
+        assertEq(vault.pendingBnbByToken(USDT), 0, "dropped token pending must not stay locked");
+        assertEq(vault.pendingBnbNoBasket(), 0.4 ether, "dropped pending should move to the shared bucket");
+    }
+
+    function test_operatorCannotExceedMinBnbCeiling() public {
+        vm.prank(TEAM_OPERATOR);
+        vm.expectRevert(bytes("min BNB above maximum"));
+        vault.setMinBnbToProcess(101 ether);
+    }
+
+    function test_operatorCannotExceedCooldownMaximum() public {
+        vm.prank(TEAM_OPERATOR);
+        vm.expectRevert(bytes("cooldown above maximum"));
+        vault.setBasketUpdateCooldown(8 days);
+    }
+
+    function test_distributeToRejectsOversizedBatch() public {
+        address[] memory users = new address[](vault.MAX_DISTRIBUTE_BATCH() + 1);
+        vm.expectRevert(bytes("batch too large"));
+        vault.distributeTo(users);
+    }
+
+    function test_noPairDoesNotDumpFullAmount() public {
+        NoLiquidityToken deadToken = new NoLiquidityToken();
+        address[] memory tokens = new address[](1);
+        tokens[0] = address(deadToken);
+        uint16[] memory weights = new uint16[](1);
+        weights[0] = 10000;
+        _skipBasketCooldown();
+        vm.prank(TEAM_OPERATOR);
+        vault.updateBasket(tokens, weights);
+
+        taxToken.mint(USER1, 100 ether);
+        vault.syncShare(USER1);
+
+        vm.deal(address(this), 1 ether);
+        (bool ok,) = address(vault).call{value: 1 ether}("");
+        assertTrue(ok);
+        vault.processPendingRevenue();
+
+        assertEq(vault.pendingBnbByToken(address(deadToken)), 1 ether, "fail-closed cap must leave BNB pending");
+        assertEq(address(vault).balance, 1 ether, "BNB must not be spent when pair/reserves are missing");
     }
 }
 

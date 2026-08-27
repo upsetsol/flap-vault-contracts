@@ -26,10 +26,7 @@ interface IPancakeRouter {
 
     function WETH() external pure returns (address);
     function factory() external pure returns (address);
-    function getAmountsOut(uint256 amountIn, address[] calldata path)
-        external
-        view
-        returns (uint256[] memory amounts);
+    function getAmountsOut(uint256 amountIn, address[] calldata path) external view returns (uint256[] memory amounts);
 }
 
 interface IPancakeFactoryMinimal {
@@ -78,9 +75,9 @@ interface ITaxTokenMainPool {
 ///          `factorySpecVersion() == "v2.3"`. Custom-error-vs-require-string
 ///          (Flap UI-01) and `autoForwardEnabled`/`forwardAddress` are NOT
 ///          addressed in this revision — tracked separately.
-///      Not yet applied: IBV-05 (unbounded `allRewardTokens` growth — no
-///      pagination added yet; document the growth cost instead), BOTH-13/14
-///      hardening.
+///      Follow-up: required initial basket; extra LP exclusion; fail-closed
+///      reserve cap; pending BNB of dropped basket tokens is not locked;
+///      operator knobs cannot lock processing; slippage ceiling is 5% (basket swap only).
 /// @dev Share sync model: a holder's share is refreshed to their current
 ///      taxToken balance at claim()/sync time, not on every transfer — this
 ///      vault cannot hook taxToken transfers (BOTH-05). Dividends are NOT a
@@ -98,9 +95,13 @@ contract IndexBasketVault is VaultBaseV3, AccessControl, ReentrancyGuard {
     uint256 private constant MAGNITUDE = 2 ** 128;
     uint256 private constant MAX_BASKET_SIZE = 5;
     uint16 private constant BPS_DENOMINATOR = 10000;
-    uint16 private constant MAX_SLIPPAGE_BPS_CEILING = 2000; // hard safety rail: never allow >20%
-    uint16 private constant MAX_RESERVE_IMPACT_BPS_CEILING = 1000; // hard safety rail: never allow >10% of reserves per swap
+    uint16 private constant MAX_SLIPPAGE_BPS_CEILING = 500; // basket swap only; operator cannot widen MEV window
+    uint16 private constant MAX_RESERVE_IMPACT_BPS_CEILING = 200; // never allow >2% of WBNB reserves per swap
     uint256 public constant MIN_BASKET_UPDATE_COOLDOWN = 1 hours;
+    uint256 public constant MAX_BASKET_UPDATE_COOLDOWN = 7 days;
+    uint256 public constant MAX_MIN_BNB_TO_PROCESS = 100 ether;
+    uint8 public constant MAX_EXTRA_PAIRS = 8;
+    uint256 public constant MAX_DISTRIBUTE_BATCH = 100;
 
     address public taxToken;
     address public pancakeRouter;
@@ -119,7 +120,7 @@ contract IndexBasketVault is VaultBaseV3, AccessControl, ReentrancyGuard {
     ///         token's share on a later processing round.
     mapping(address => uint256) public pendingBnbByToken;
 
-    uint256 public minBnbToProcess;
+    uint256 public minBnbToProcess = 0.03 ether; // per basket slot; skip dust swaps
     uint16 public maxSlippageBps = 500; // 5% default
     uint16 public maxReserveImpactBps = 200; // 2% of WBNB pair reserve per swap, default
 
@@ -128,6 +129,9 @@ contract IndexBasketVault is VaultBaseV3, AccessControl, ReentrancyGuard {
 
     address[] public basketTokens;
     mapping(address => uint16) public basketWeightBps;
+
+    address[] public extraPairs;
+    mapping(address => bool) public isExtraPair;
 
     address[] public allRewardTokens;
     mapping(address => bool) public isKnownRewardToken;
@@ -152,8 +156,11 @@ contract IndexBasketVault is VaultBaseV3, AccessControl, ReentrancyGuard {
     event ShareSynced(address indexed user, uint256 newShare);
     event SwapFailed(address indexed token, uint256 bnbAmount);
     event SwapSkipped(address indexed token, uint256 bnbAmount, string reason);
+    event ExtraPairAdded(address indexed pair);
     event Excluded(address indexed account, bool excluded);
     event EmergencyWithdraw(address indexed token, uint256 amount, address indexed to);
+    event Distributed(address indexed user, bool success);
+    event ClaimTokenFailed(address indexed user, address indexed token);
 
     error AlreadyInitialized();
     error InvalidBasket();
@@ -161,16 +168,19 @@ contract IndexBasketVault is VaultBaseV3, AccessControl, ReentrancyGuard {
     error CannotRevokeGuardianRole();
     error GuardianOnly();
     error BasketUpdateCooldownActive();
+    error ZeroAddress();
+    error PairLimit();
+    error PairAlreadySet();
+    error NotAContract();
 
     modifier onlyGuardian() {
         if (msg.sender != _getGuardian()) revert GuardianOnly();
         _;
     }
 
-    /// @param initialTokens Optional initial basket (can be empty — team then
-    ///        calls updateBasket() separately, subject to the same cooldown
-    ///        starting from deployment). Passing it here avoids the
-    ///        empty-basket launch window entirely (IBV-03).
+    /// @param initialTokens Required initial basket. Empty launch is rejected
+    ///        so tax BNB cannot sit unallocated and later dump into a
+    ///        last-second team-chosen token.
     function initializeVault(
         address _taxToken,
         address _pancakeRouter,
@@ -180,6 +190,7 @@ contract IndexBasketVault is VaultBaseV3, AccessControl, ReentrancyGuard {
         uint16[] calldata initialWeights
     ) external {
         if (initialized) revert AlreadyInitialized();
+        if (_taxToken == address(0) || _pancakeRouter == address(0)) revert ZeroAddress();
         initialized = true;
 
         taxToken = _taxToken;
@@ -196,9 +207,7 @@ contract IndexBasketVault is VaultBaseV3, AccessControl, ReentrancyGuard {
             _grantRole(OPERATOR_ROLE, _teamOperator);
         }
 
-        if (initialTokens.length > 0) {
-            _setBasket(initialTokens, initialWeights);
-        }
+        _setBasket(initialTokens, initialWeights);
     }
 
     function revokeRole(bytes32 role, address account) public override onlyRole(getRoleAdmin(role)) {
@@ -235,6 +244,7 @@ contract IndexBasketVault is VaultBaseV3, AccessControl, ReentrancyGuard {
 
     function setBasketUpdateCooldown(uint256 cooldown) external onlyRole(OPERATOR_ROLE) {
         require(cooldown >= MIN_BASKET_UPDATE_COOLDOWN, "cooldown below minimum");
+        require(cooldown <= MAX_BASKET_UPDATE_COOLDOWN, "cooldown above maximum");
         basketUpdateCooldown = cooldown;
     }
 
@@ -260,7 +270,22 @@ contract IndexBasketVault is VaultBaseV3, AccessControl, ReentrancyGuard {
         if (total != BPS_DENOMINATOR) revert InvalidBasket();
 
         for (uint256 i = 0; i < basketTokens.length; i++) {
-            basketWeightBps[basketTokens[i]] = 0;
+            address oldToken = basketTokens[i];
+            bool stillInBasket;
+            for (uint256 j = 0; j < tokens.length; j++) {
+                if (tokens[j] == oldToken) {
+                    stillInBasket = true;
+                    break;
+                }
+            }
+            if (!stillInBasket) {
+                uint256 leftover = pendingBnbByToken[oldToken];
+                if (leftover > 0) {
+                    pendingBnbNoBasket += leftover;
+                    pendingBnbByToken[oldToken] = 0;
+                }
+            }
+            basketWeightBps[oldToken] = 0;
         }
 
         delete basketTokens;
@@ -302,6 +327,25 @@ contract IndexBasketVault is VaultBaseV3, AccessControl, ReentrancyGuard {
     // ------------------------------------------------------------------
     // Swap safety parameters — operator-tunable within hard-coded ceilings
     // ------------------------------------------------------------------
+    function extraPairCount() external view returns (uint256) {
+        return extraPairs.length;
+    }
+
+    /// @notice Permanently exclude an extra DEX pair from dividends. Cannot be
+    ///         removed — same one-way model as Flap's own mainPool exclusion.
+    function addExtraPair(address pair_) external onlyRole(OPERATOR_ROLE) {
+        if (pair_ == address(0)) revert ZeroAddress();
+        if (pair_.code.length == 0) revert NotAContract();
+        if (isExtraPair[pair_]) revert PairAlreadySet();
+        if (extraPairs.length >= MAX_EXTRA_PAIRS) revert PairLimit();
+        isExtraPair[pair_] = true;
+        extraPairs.push(pair_);
+        if (lastSyncedBalance[pair_] > 0) {
+            _applyShareChange(pair_, 0);
+        }
+        emit ExtraPairAdded(pair_);
+    }
+
     function setMaxSlippageBps(uint16 bps) external onlyRole(OPERATOR_ROLE) {
         require(bps <= MAX_SLIPPAGE_BPS_CEILING, "slippage above safety ceiling");
         maxSlippageBps = bps;
@@ -313,6 +357,7 @@ contract IndexBasketVault is VaultBaseV3, AccessControl, ReentrancyGuard {
     }
 
     function setMinBnbToProcess(uint256 amount) external onlyRole(OPERATOR_ROLE) {
+        require(amount <= MAX_MIN_BNB_TO_PROCESS, "min BNB above maximum");
         minBnbToProcess = amount;
     }
 
@@ -434,29 +479,29 @@ contract IndexBasketVault is VaultBaseV3, AccessControl, ReentrancyGuard {
         try IPancakeRouter(pancakeRouter).factory() returns (address f) {
             factory = f;
         } catch {
-            return bnbAmount;
+            return 0;
         }
 
         address pair;
         try IPancakeFactoryMinimal(factory).getPair(weth, token) returns (address p) {
             pair = p;
         } catch {
-            return bnbAmount;
+            return 0;
         }
-        if (pair == address(0)) return bnbAmount;
+        if (pair == address(0)) return 0;
 
         try IPancakePairMinimal(pair).getReserves() returns (uint112 r0, uint112 r1, uint32) {
             address token0;
             try IPancakePairMinimal(pair).token0() returns (address t0) {
                 token0 = t0;
             } catch {
-                return bnbAmount;
+                return 0;
             }
             uint256 wethReserve = token0 == weth ? uint256(r0) : uint256(r1);
             uint256 cap = (wethReserve * maxReserveImpactBps) / BPS_DENOMINATOR;
             return bnbAmount > cap ? cap : bnbAmount;
         } catch {
-            return bnbAmount;
+            return 0;
         }
     }
 
@@ -480,6 +525,7 @@ contract IndexBasketVault is VaultBaseV3, AccessControl, ReentrancyGuard {
 
     function _isProtectedAddress(address a) internal view returns (bool) {
         if (a == address(this) || a == taxToken || a == address(0) || a == address(0xdEaD)) return true;
+        if (isExtraPair[a]) return true;
         try ITaxTokenMainPool(taxToken).mainPool() returns (address pool) {
             if (pool != address(0) && a == pool) return true;
         } catch {}
@@ -535,6 +581,7 @@ contract IndexBasketVault is VaultBaseV3, AccessControl, ReentrancyGuard {
         uint256 balBefore = IERC20(token).balanceOf(msg.sender);
         IERC20(token).safeTransfer(msg.sender, owed);
         uint256 actuallyReceived = IERC20(token).balanceOf(msg.sender) - balBefore;
+        if (actuallyReceived == 0) revert NothingToClaim();
 
         withdrawnDividends[token][msg.sender] += actuallyReceived;
         totalClaimed[token] += actuallyReceived;
@@ -552,8 +599,18 @@ contract IndexBasketVault is VaultBaseV3, AccessControl, ReentrancyGuard {
     ///        the chain has no way to enumerate all taxToken holders. Passing
     ///        a protected address (pair/dead/vault/taxToken) is harmless.
     function distributeTo(address[] calldata users) external nonReentrant {
+        require(users.length <= MAX_DISTRIBUTE_BATCH, "batch too large");
         for (uint256 i = 0; i < users.length; i++) {
-            try this.pushClaimFor(users[i]) {} catch {}
+            address user = users[i];
+            if (_isProtectedAddress(user) || excludedFromDividends[user]) {
+                emit Distributed(user, false);
+                continue;
+            }
+            try this.pushClaimFor(user) {
+                emit Distributed(user, true);
+            } catch {
+                emit Distributed(user, false);
+            }
         }
     }
 
@@ -562,22 +619,37 @@ contract IndexBasketVault is VaultBaseV3, AccessControl, ReentrancyGuard {
         _claimAllFor(user);
     }
 
+    function pushClaimToken(address user, address token) external {
+        require(msg.sender == address(this), "internal only");
+        _payoutToken(user, token);
+    }
+
     function _claimAllFor(address user) internal returns (bool claimedAny) {
         _syncShare(user);
         for (uint256 i = 0; i < allRewardTokens.length; i++) {
             address token = allRewardTokens[i];
             uint256 owed = withdrawableDividendOf(user, token);
             if (owed == 0) continue;
-
-            uint256 balBefore = IERC20(token).balanceOf(user);
-            IERC20(token).safeTransfer(user, owed);
-            uint256 actuallyReceived = IERC20(token).balanceOf(user) - balBefore;
-
-            withdrawnDividends[token][user] += actuallyReceived;
-            totalClaimed[token] += actuallyReceived;
-            emit DividendClaimed(user, token, actuallyReceived);
-            claimedAny = true;
+            try this.pushClaimToken(user, token) {
+                claimedAny = true;
+            } catch {
+                emit ClaimTokenFailed(user, token);
+            }
         }
+    }
+
+    function _payoutToken(address user, address token) internal {
+        uint256 owed = withdrawableDividendOf(user, token);
+        if (owed == 0) revert NothingToClaim();
+
+        uint256 balBefore = IERC20(token).balanceOf(user);
+        IERC20(token).safeTransfer(user, owed);
+        uint256 actuallyReceived = IERC20(token).balanceOf(user) - balBefore;
+        if (actuallyReceived == 0) revert NothingToClaim();
+
+        withdrawnDividends[token][user] += actuallyReceived;
+        totalClaimed[token] += actuallyReceived;
+        emit DividendClaimed(user, token, actuallyReceived);
     }
 
     // ------------------------------------------------------------------
@@ -644,7 +716,8 @@ contract IndexBasketVault is VaultBaseV3, AccessControl, ReentrancyGuard {
         schema.methods[1].isWriteMethod = true;
 
         schema.methods[2].name = "distributeTo";
-        schema.methods[2].description = "Pushes pending dividends to a batch of addresses in one transaction. Anyone can call this, and the caller pays gas.";
+        schema.methods[2].description =
+            "Pushes pending dividends to a batch of addresses in one transaction. Anyone can call this, and the caller pays gas.";
         schema.methods[2].inputs = new FieldDescriptor[](1);
         schema.methods[2].inputs[0] = FieldDescriptor("users", "address", "Addresses to distribute to", 0);
         schema.methods[2].isInputArray = true;
@@ -667,15 +740,21 @@ contract IndexBasketVaultFactory is VaultFactoryBaseV2 {
     address public immutable pancakeRouter;
 
     constructor(address _pancakeRouter) {
+        require(_pancakeRouter != address(0), "router required");
+        require(IPancakeRouter(_pancakeRouter).WETH() != address(0), "router WETH missing");
         pancakeRouter = _pancakeRouter;
     }
 
     /// @dev vaultData = abi.encode(address teamOperator, uint256 minimumShareBalance,
-    ///      address[] initialTokens, uint16[] initialWeights). Pass empty
-    ///      arrays for initialTokens/initialWeights to launch with no basket
-    ///      (team must then call updateBasket() separately) — but setting it
-    ///      here avoids the empty-basket window entirely (IBV-03).
-    function newVault(address taxToken, address quoteToken, address, /* creator */ bytes calldata vaultData)
+    ///      address[] initialTokens, uint16[] initialWeights).
+    ///      initialTokens MUST be non-empty (required basket at birth).
+    function newVault(
+        address taxToken,
+        address quoteToken,
+        address,
+        /* creator */
+        bytes calldata vaultData
+    )
         external
         override
         returns (address vault)
@@ -683,8 +762,12 @@ contract IndexBasketVaultFactory is VaultFactoryBaseV2 {
         require(msg.sender == _getVaultPortal(), "Only VaultPortal");
         require(quoteToken == address(0), "Only native BNB quote token supported");
 
-        (address teamOperator, uint256 minimumShareBalance, address[] memory initialTokens, uint16[] memory initialWeights)
-        = abi.decode(vaultData, (address, uint256, address[], uint16[]));
+        (
+            address teamOperator,
+            uint256 minimumShareBalance,
+            address[] memory initialTokens,
+            uint16[] memory initialWeights
+        ) = abi.decode(vaultData, (address, uint256, address[], uint16[]));
 
         IndexBasketVault v = new IndexBasketVault();
         v.initializeVault(taxToken, pancakeRouter, teamOperator, minimumShareBalance, initialTokens, initialWeights);
@@ -703,12 +786,14 @@ contract IndexBasketVaultFactory is VaultFactoryBaseV2 {
 
     function vaultDataSchema() public pure override returns (VaultDataSchema memory schema) {
         schema.description =
-            "Creates an index-basket vault: pays holders dividends in a team-curated basket of up to 5 tokens.";
+            "Creates an index-basket vault: pays holders dividends in a team-curated basket of up to 5 tokens. Initial basket is required.";
         schema.fields = new FieldDescriptor[](4);
         schema.fields[0] = FieldDescriptor("teamOperator", "address", "Address allowed to update the basket", 0);
-        schema.fields[1] = FieldDescriptor("minimumShareBalance", "uint256", "Minimum token balance to be eligible for dividends", 18);
-        schema.fields[2] = FieldDescriptor("initialTokens", "address", "Optional initial basket tokens (up to 5)", 0);
-        schema.fields[3] = FieldDescriptor("initialWeights", "uint16", "Matching weights in basis points, summing to 10000", 0);
+        schema.fields[1] =
+            FieldDescriptor("minimumShareBalance", "uint256", "Minimum token balance to be eligible for dividends", 18);
+        schema.fields[2] = FieldDescriptor("initialTokens", "address", "Required initial basket tokens (1-5)", 0);
+        schema.fields[3] =
+            FieldDescriptor("initialWeights", "uint16", "Matching weights in basis points, summing to 10000", 0);
         schema.isArray = false;
     }
 }

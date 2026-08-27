@@ -26,10 +26,7 @@ interface IPancakeRouter {
 
     function WETH() external pure returns (address);
     function factory() external pure returns (address);
-    function getAmountsOut(uint256 amountIn, address[] calldata path)
-        external
-        view
-        returns (uint256[] memory amounts);
+    function getAmountsOut(uint256 amountIn, address[] calldata path) external view returns (uint256[] memory amounts);
 }
 
 interface IPancakeFactoryMinimal {
@@ -71,8 +68,10 @@ contract CustomDividendVault is VaultBaseV3, AccessControl, ReentrancyGuard {
     bytes32 public constant OPERATOR_ROLE = keccak256("OPERATOR_ROLE");
     uint256 private constant MAGNITUDE = 2 ** 128;
     uint16 private constant BPS_DENOMINATOR = 10000;
-    uint16 private constant MAX_SLIPPAGE_BPS_CEILING = 2000;
-    uint16 private constant MAX_RESERVE_IMPACT_BPS_CEILING = 1000;
+    uint16 private constant MAX_SLIPPAGE_BPS_CEILING = 500; // basket/dividend swap only; operator cannot widen MEV window
+    uint16 private constant MAX_RESERVE_IMPACT_BPS_CEILING = 200;
+    uint256 public constant MAX_MIN_BNB_TO_PROCESS = 100 ether;
+    uint8 public constant MAX_EXTRA_PAIRS = 8;
 
     address public taxToken;
     address public dividendToken;
@@ -81,7 +80,7 @@ contract CustomDividendVault is VaultBaseV3, AccessControl, ReentrancyGuard {
     uint256 public totalEligibleSupply;
 
     uint256 public pendingBnb;
-    uint256 public minBnbToProcess;
+    uint256 public minBnbToProcess = 0.03 ether; // skip dust swaps
     uint16 public maxSlippageBps = 500;
     uint16 public maxReserveImpactBps = 200;
 
@@ -90,6 +89,8 @@ contract CustomDividendVault is VaultBaseV3, AccessControl, ReentrancyGuard {
     mapping(address => uint256) private withdrawnDividends;
     mapping(address => uint256) private lastSyncedBalance;
     mapping(address => bool) public excludedFromDividends;
+    address[] public extraPairs;
+    mapping(address => bool) public isExtraPair;
 
     uint256 public totalDeposited;
     uint256 public totalClaimed;
@@ -104,10 +105,17 @@ contract CustomDividendVault is VaultBaseV3, AccessControl, ReentrancyGuard {
     event Excluded(address indexed account, bool excluded);
     event EmergencyWithdraw(address indexed token, uint256 amount, address indexed to);
 
+    event ExtraPairAdded(address indexed pair);
+    event Distributed(address indexed user, bool success);
+
     error AlreadyInitialized();
     error NothingToClaim();
     error CannotRevokeGuardianRole();
     error GuardianOnly();
+    error ZeroAddress();
+    error PairLimit();
+    error PairAlreadySet();
+    error NotAContract();
 
     modifier onlyGuardian() {
         if (msg.sender != _getGuardian()) revert GuardianOnly();
@@ -121,6 +129,10 @@ contract CustomDividendVault is VaultBaseV3, AccessControl, ReentrancyGuard {
         uint256 _minimumShareBalance
     ) external {
         if (initialized) revert AlreadyInitialized();
+        if (_taxToken == address(0) || _dividendToken == address(0) || _pancakeRouter == address(0)) {
+            revert ZeroAddress();
+        }
+        if (_dividendToken == _taxToken) revert ZeroAddress();
         initialized = true;
 
         taxToken = _taxToken;
@@ -157,7 +169,25 @@ contract CustomDividendVault is VaultBaseV3, AccessControl, ReentrancyGuard {
     }
 
     function setMinBnbToProcess(uint256 amount) external onlyRole(OPERATOR_ROLE) {
+        require(amount <= MAX_MIN_BNB_TO_PROCESS, "min BNB above maximum");
         minBnbToProcess = amount;
+    }
+
+    function extraPairCount() external view returns (uint256) {
+        return extraPairs.length;
+    }
+
+    function addExtraPair(address pair_) external onlyRole(OPERATOR_ROLE) {
+        if (pair_ == address(0)) revert ZeroAddress();
+        if (pair_.code.length == 0) revert NotAContract();
+        if (isExtraPair[pair_]) revert PairAlreadySet();
+        if (extraPairs.length >= MAX_EXTRA_PAIRS) revert PairLimit();
+        isExtraPair[pair_] = true;
+        extraPairs.push(pair_);
+        if (lastSyncedBalance[pair_] > 0) {
+            _applyShareChange(pair_, 0);
+        }
+        emit ExtraPairAdded(pair_);
     }
 
     // ------------------------------------------------------------------
@@ -227,29 +257,29 @@ contract CustomDividendVault is VaultBaseV3, AccessControl, ReentrancyGuard {
         try IPancakeRouter(pancakeRouter).factory() returns (address f) {
             factory = f;
         } catch {
-            return bnbAmount;
+            return 0;
         }
 
         address pair;
         try IPancakeFactoryMinimal(factory).getPair(weth, dividendToken) returns (address p) {
             pair = p;
         } catch {
-            return bnbAmount;
+            return 0;
         }
-        if (pair == address(0)) return bnbAmount;
+        if (pair == address(0)) return 0;
 
         try IPancakePairMinimal(pair).getReserves() returns (uint112 r0, uint112 r1, uint32) {
             address token0;
             try IPancakePairMinimal(pair).token0() returns (address t0) {
                 token0 = t0;
             } catch {
-                return bnbAmount;
+                return 0;
             }
             uint256 wethReserve = token0 == weth ? uint256(r0) : uint256(r1);
             uint256 cap = (wethReserve * maxReserveImpactBps) / BPS_DENOMINATOR;
             return bnbAmount > cap ? cap : bnbAmount;
         } catch {
-            return bnbAmount;
+            return 0;
         }
     }
 
@@ -273,6 +303,7 @@ contract CustomDividendVault is VaultBaseV3, AccessControl, ReentrancyGuard {
 
     function _isProtectedAddress(address a) internal view returns (bool) {
         if (a == address(this) || a == taxToken || a == address(0) || a == address(0xdEaD)) return true;
+        if (isExtraPair[a]) return true;
         try ITaxTokenMainPool(taxToken).mainPool() returns (address pool) {
             if (pool != address(0) && a == pool) return true;
         } catch {}
@@ -317,6 +348,7 @@ contract CustomDividendVault is VaultBaseV3, AccessControl, ReentrancyGuard {
         uint256 balBefore = IERC20(dividendToken).balanceOf(msg.sender);
         IERC20(dividendToken).safeTransfer(msg.sender, owed);
         uint256 actuallyReceived = IERC20(dividendToken).balanceOf(msg.sender) - balBefore;
+        if (actuallyReceived == 0) revert NothingToClaim();
 
         withdrawnDividends[msg.sender] += actuallyReceived;
         totalClaimed += actuallyReceived;
@@ -393,11 +425,19 @@ contract CustomDividendVaultFactory is VaultFactoryBaseV2 {
     address public immutable pancakeRouter;
 
     constructor(address _pancakeRouter) {
+        require(_pancakeRouter != address(0), "router required");
+        require(IPancakeRouter(_pancakeRouter).WETH() != address(0), "router WETH missing");
         pancakeRouter = _pancakeRouter;
     }
 
     /// @dev vaultData = abi.encode(address dividendToken, uint256 minimumShareBalance)
-    function newVault(address taxToken, address quoteToken, address, /* creator */ bytes calldata vaultData)
+    function newVault(
+        address taxToken,
+        address quoteToken,
+        address,
+        /* creator */
+        bytes calldata vaultData
+    )
         external
         override
         returns (address vault)
@@ -406,6 +446,11 @@ contract CustomDividendVaultFactory is VaultFactoryBaseV2 {
         require(quoteToken == address(0), "Only native BNB quote token supported");
 
         (address dividendToken, uint256 minimumShareBalance) = abi.decode(vaultData, (address, uint256));
+        require(dividendToken != address(0) && dividendToken != taxToken, "bad dividend token");
+        require(dividendToken.code.length > 0, "dividend token not a contract");
+        address weth = IPancakeRouter(pancakeRouter).WETH();
+        address pancakeFactory = IPancakeRouter(pancakeRouter).factory();
+        require(IPancakeFactoryMinimal(pancakeFactory).getPair(weth, dividendToken) != address(0), "no WBNB pair");
 
         CustomDividendVault v = new CustomDividendVault();
         v.initializeVault(taxToken, dividendToken, pancakeRouter, minimumShareBalance);
@@ -425,8 +470,10 @@ contract CustomDividendVaultFactory is VaultFactoryBaseV2 {
         schema.description =
             "Creates a vault that pays holders dividends in any ERC-20 token, funded automatically by the token's tax revenue.";
         schema.fields = new FieldDescriptor[](2);
-        schema.fields[0] = FieldDescriptor("dividendToken", "address", "ERC-20 token holders will receive as dividends", 0);
-        schema.fields[1] = FieldDescriptor("minimumShareBalance", "uint256", "Minimum token balance to be eligible for dividends", 18);
+        schema.fields[0] =
+            FieldDescriptor("dividendToken", "address", "ERC-20 token holders will receive as dividends", 0);
+        schema.fields[1] =
+            FieldDescriptor("minimumShareBalance", "uint256", "Minimum token balance to be eligible for dividends", 18);
         schema.isArray = false;
     }
 }
