@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.13;
 
-import {VaultBaseV2} from "./flap/VaultBaseV2.sol";
+import {VaultBaseV3} from "./flap/VaultBaseV3.sol";
 import {VaultFactoryBaseV2} from "./flap/VaultFactoryBaseV2.sol";
-import {IVaultFactoryValidationV2} from "./flap/IVaultFactory.sol";
 import {
     VaultUISchema,
     VaultMethodSchema,
@@ -13,6 +12,7 @@ import {
 } from "./flap/IVaultSchemasV1.sol";
 
 import {IERC20} from "@openzeppelin/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/token/ERC20/utils/SafeERC20.sol";
 import {AccessControl} from "@openzeppelin/access/AccessControl.sol";
 import {ReentrancyGuard} from "@openzeppelin/security/ReentrancyGuard.sol";
 
@@ -25,6 +25,24 @@ interface IPancakeRouter {
     ) external payable;
 
     function WETH() external pure returns (address);
+    function factory() external pure returns (address);
+    function getAmountsOut(uint256 amountIn, address[] calldata path)
+        external
+        view
+        returns (uint256[] memory amounts);
+}
+
+interface IPancakeFactoryMinimal {
+    function getPair(address tokenA, address tokenB) external view returns (address pair);
+}
+
+interface IPancakePairMinimal {
+    function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
+    function token0() external view returns (address);
+}
+
+interface ITaxTokenMainPool {
+    function mainPool() external view returns (address);
 }
 
 /// @title CustomDividendVault
@@ -32,12 +50,29 @@ interface IPancakeRouter {
 ///         dividend token and pays holders of `taxToken` pro-rata.
 /// @dev Guardian address is NOT a constructor parameter — it is resolved on
 ///      every call via `_getGuardian()` from VaultBase, which returns Flap's
-///      own security-team address per chain. This matches the mandate in
-///      VaultBase.sol: "the Guardian must always retain a backup path to
-///      call permissioned functions."
-contract CustomDividendVault is VaultBaseV2, AccessControl, ReentrancyGuard {
+///      own security-team address per chain.
+/// @dev SECURITY NOTE (post-review, see flap-vault-contracts-security-review.md):
+///      Pass 1 fixes (Critical/High): receive()-only-accumulates (BOTH-01,
+///      CDV-01), slippage floor + reserve cap + threshold (BOTH-02, BOTH-07),
+///      Guardian-only emergency with reserved-balance protection (BOTH-10),
+///      hard-excluded protected addresses (BOTH-03, BOTH-04, BOTH-12).
+///      Pass 2 fixes (this revision):
+///        - BOTH-09: SafeERC20 for all payouts, plus balance-delta
+///          measurement so a fee-on-transfer dividend token can no longer
+///          create a silent accounting/balance mismatch.
+///        - BOTH-11 (partial): now extends `VaultBaseV3`, declares
+///          `vaultQuoteToken() == address(0)` (native); factory advertises
+///          `factorySpecVersion() == "v2.3"`.
+///      IBV-02/IBV-03 don't apply here — this vault has a single, fixed
+///      dividendToken set once at construction, not a mutable basket.
+contract CustomDividendVault is VaultBaseV3, AccessControl, ReentrancyGuard {
+    using SafeERC20 for IERC20;
+
     bytes32 public constant OPERATOR_ROLE = keccak256("OPERATOR_ROLE");
     uint256 private constant MAGNITUDE = 2 ** 128;
+    uint16 private constant BPS_DENOMINATOR = 10000;
+    uint16 private constant MAX_SLIPPAGE_BPS_CEILING = 2000;
+    uint16 private constant MAX_RESERVE_IMPACT_BPS_CEILING = 1000;
 
     address public taxToken;
     address public dividendToken;
@@ -45,27 +80,40 @@ contract CustomDividendVault is VaultBaseV2, AccessControl, ReentrancyGuard {
     uint256 public minimumShareBalance;
     uint256 public totalEligibleSupply;
 
+    uint256 public pendingBnb;
+    uint256 public minBnbToProcess;
+    uint16 public maxSlippageBps = 500;
+    uint16 public maxReserveImpactBps = 200;
+
     uint256 private magnifiedDividendPerShare;
     mapping(address => int256) private magnifiedCorrections;
     mapping(address => uint256) private withdrawnDividends;
     mapping(address => uint256) private lastSyncedBalance;
     mapping(address => bool) public excludedFromDividends;
 
+    uint256 public totalDeposited;
+    uint256 public totalClaimed;
+
     bool private initialized;
 
     event DividendsDeposited(uint256 bnbIn, uint256 dividendTokenOut);
     event DividendClaimed(address indexed user, uint256 amount);
     event ShareSynced(address indexed user, uint256 newShare);
+    event SwapFailed(uint256 bnbAmount);
+    event SwapSkipped(uint256 bnbAmount, string reason);
+    event Excluded(address indexed account, bool excluded);
+    event EmergencyWithdraw(address indexed token, uint256 amount, address indexed to);
 
     error AlreadyInitialized();
-    error SwapFailed();
     error NothingToClaim();
+    error CannotRevokeGuardianRole();
+    error GuardianOnly();
 
-    /// @dev Non-upgradeable version: `newVault` deploys one instance per
-    ///      token directly (no beacon proxy). Simpler to audit; the
-    ///      recommended beacon-proxy pattern is the next step once this
-    ///      is battle-tested — see FreeCoinVaultUpgradeable in this repo
-    ///      for the beacon-based reference implementation.
+    modifier onlyGuardian() {
+        if (msg.sender != _getGuardian()) revert GuardianOnly();
+        _;
+    }
+
     function initializeVault(
         address _taxToken,
         address _dividendToken,
@@ -85,65 +133,153 @@ contract CustomDividendVault is VaultBaseV2, AccessControl, ReentrancyGuard {
         _grantRole(OPERATOR_ROLE, guardian);
     }
 
-    /// @dev MANDATE from VaultBase.sol: Guardian's role must never be
-    ///      revocable by anyone but itself.
     function revokeRole(bytes32 role, address account) public override onlyRole(getRoleAdmin(role)) {
         if (account == _getGuardian()) revert CannotRevokeGuardianRole();
         super.revokeRole(role, account);
     }
 
-    error CannotRevokeGuardianRole();
-
-    receive() external payable {
-        // If nobody has been synced yet, totalEligibleSupply is 0 — swapping
-        // now would permanently orphan the proceeds (no share to attribute
-        // them to). Just let the BNB sit here; call processPendingRevenue()
-        // once at least one holder has been synced to convert it retroactively.
-        if (totalEligibleSupply == 0) return;
-        _swapAndDeposit(address(this).balance);
+    /// @notice Native-only vault: always accounts revenue in BNB.
+    function vaultQuoteToken() public pure override returns (address) {
+        return address(0);
     }
 
-    /// @notice Manually triggers conversion of whatever native BNB is
-    ///         currently sitting in the vault into dividendToken, using the
-    ///         CURRENT totalEligibleSupply. Exists to unstick funds that
-    ///         arrived via receive() while totalEligibleSupply was still 0.
-    ///         Permissionless — there's no way to misuse it to redirect
-    ///         funds anywhere but the existing dividendToken.
+    // ------------------------------------------------------------------
+    // Swap safety parameters
+    // ------------------------------------------------------------------
+    function setMaxSlippageBps(uint16 bps) external onlyRole(OPERATOR_ROLE) {
+        require(bps <= MAX_SLIPPAGE_BPS_CEILING, "slippage above safety ceiling");
+        maxSlippageBps = bps;
+    }
+
+    function setMaxReserveImpactBps(uint16 bps) external onlyRole(OPERATOR_ROLE) {
+        require(bps <= MAX_RESERVE_IMPACT_BPS_CEILING, "impact above safety ceiling");
+        maxReserveImpactBps = bps;
+    }
+
+    function setMinBnbToProcess(uint256 amount) external onlyRole(OPERATOR_ROLE) {
+        minBnbToProcess = amount;
+    }
+
+    // ------------------------------------------------------------------
+    // Receives tax revenue — accumulates ONLY, never swaps here (BOTH-01)
+    // ------------------------------------------------------------------
+    receive() external payable nonReentrant {
+        pendingBnb += msg.value;
+    }
+
     function processPendingRevenue() external nonReentrant {
         require(totalEligibleSupply > 0, "no eligible holders yet");
-        require(address(this).balance > 0, "nothing pending");
-        _swapAndDeposit(address(this).balance);
+        require(pendingBnb > 0, "nothing pending");
+        require(pendingBnb >= minBnbToProcess, "below processing threshold");
+
+        uint256 amountToProcess = pendingBnb;
+        pendingBnb = 0;
+
+        uint256 processed = _swapAndDeposit(amountToProcess);
+        uint256 leftover = amountToProcess - processed;
+        if (leftover > 0) {
+            pendingBnb += leftover;
+        }
     }
 
-    function _swapAndDeposit(uint256 bnbAmount) internal {
+    function _swapAndDeposit(uint256 bnbAmount) internal returns (uint256 processed) {
+        address weth = IPancakeRouter(pancakeRouter).WETH();
+
+        uint256 cappedAmount = _capAgainstReserves(weth, bnbAmount);
+        if (cappedAmount == 0) {
+            emit SwapSkipped(bnbAmount, "capped to zero (no/low liquidity)");
+            return 0;
+        }
+
         address[] memory path = new address[](2);
-        path[0] = IPancakeRouter(pancakeRouter).WETH();
+        path[0] = weth;
         path[1] = dividendToken;
+
+        uint256 minOut;
+        try IPancakeRouter(pancakeRouter).getAmountsOut(cappedAmount, path) returns (uint256[] memory amounts) {
+            uint256 expectedOut = amounts[amounts.length - 1];
+            minOut = (expectedOut * (BPS_DENOMINATOR - maxSlippageBps)) / BPS_DENOMINATOR;
+        } catch {
+            emit SwapFailed(cappedAmount);
+            return 0;
+        }
 
         uint256 balBefore = IERC20(dividendToken).balanceOf(address(this));
 
-        try IPancakeRouter(pancakeRouter).swapExactETHForTokensSupportingFeeOnTransferTokens{value: bnbAmount}(
-            0, path, address(this), block.timestamp + 300
+        try IPancakeRouter(pancakeRouter).swapExactETHForTokensSupportingFeeOnTransferTokens{value: cappedAmount}(
+            minOut, path, address(this), block.timestamp + 300
         ) {
             uint256 received = IERC20(dividendToken).balanceOf(address(this)) - balBefore;
             if (received > 0 && totalEligibleSupply > 0) {
                 magnifiedDividendPerShare += (received * MAGNITUDE) / totalEligibleSupply;
-                emit DividendsDeposited(bnbAmount, received);
+                totalDeposited += received;
+                emit DividendsDeposited(cappedAmount, received);
             }
+            processed = cappedAmount;
         } catch {
-            revert SwapFailed();
+            emit SwapFailed(cappedAmount);
+            processed = 0;
         }
     }
 
-    /// @notice Refreshes `user`'s share to their current taxToken balance.
-    ///         Anyone may call this for any address; it is safe and permissionless
-    ///         because it only ever corrects a holder's own tracked share.
-    function syncShare(address user) public {
-        if (excludedFromDividends[user]) return;
+    function _capAgainstReserves(address weth, uint256 bnbAmount) internal view returns (uint256) {
+        address factory;
+        try IPancakeRouter(pancakeRouter).factory() returns (address f) {
+            factory = f;
+        } catch {
+            return bnbAmount;
+        }
+
+        address pair;
+        try IPancakeFactoryMinimal(factory).getPair(weth, dividendToken) returns (address p) {
+            pair = p;
+        } catch {
+            return bnbAmount;
+        }
+        if (pair == address(0)) return bnbAmount;
+
+        try IPancakePairMinimal(pair).getReserves() returns (uint112 r0, uint112 r1, uint32) {
+            address token0;
+            try IPancakePairMinimal(pair).token0() returns (address t0) {
+                token0 = t0;
+            } catch {
+                return bnbAmount;
+            }
+            uint256 wethReserve = token0 == weth ? uint256(r0) : uint256(r1);
+            uint256 cap = (wethReserve * maxReserveImpactBps) / BPS_DENOMINATOR;
+            return bnbAmount > cap ? cap : bnbAmount;
+        } catch {
+            return bnbAmount;
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Share sync
+    // ------------------------------------------------------------------
+    function syncShare(address user) external nonReentrant {
+        _syncShare(user);
+    }
+
+    function _syncShare(address user) internal {
+        if (excludedFromDividends[user] || _isProtectedAddress(user)) {
+            _applyShareChange(user, 0);
+            return;
+        }
 
         uint256 newBalance = IERC20(taxToken).balanceOf(user);
         if (newBalance < minimumShareBalance) newBalance = 0;
+        _applyShareChange(user, newBalance);
+    }
 
+    function _isProtectedAddress(address a) internal view returns (bool) {
+        if (a == address(this) || a == taxToken || a == address(0) || a == address(0xdEaD)) return true;
+        try ITaxTokenMainPool(taxToken).mainPool() returns (address pool) {
+            if (pool != address(0) && a == pool) return true;
+        } catch {}
+        return false;
+    }
+
+    function _applyShareChange(address user, uint256 newBalance) internal {
         uint256 oldBalance = lastSyncedBalance[user];
         if (newBalance == oldBalance) return;
 
@@ -169,31 +305,50 @@ contract CustomDividendVault is VaultBaseV2, AccessControl, ReentrancyGuard {
         return accumulative - withdrawnDividends[user];
     }
 
+    /// @notice SECURITY FIX (BOTH-09): SafeERC20 + balance-delta measurement
+    ///         so a fee-on-transfer dividendToken can't create a silent
+    ///         accounting/balance mismatch.
     function claim() external nonReentrant {
-        syncShare(msg.sender);
+        _syncShare(msg.sender);
 
         uint256 owed = withdrawableDividendOf(msg.sender);
         if (owed == 0) revert NothingToClaim();
 
-        withdrawnDividends[msg.sender] += owed;
-        bool ok = IERC20(dividendToken).transfer(msg.sender, owed);
-        require(ok, "transfer failed");
+        uint256 balBefore = IERC20(dividendToken).balanceOf(msg.sender);
+        IERC20(dividendToken).safeTransfer(msg.sender, owed);
+        uint256 actuallyReceived = IERC20(dividendToken).balanceOf(msg.sender) - balBefore;
 
-        emit DividendClaimed(msg.sender, owed);
+        withdrawnDividends[msg.sender] += actuallyReceived;
+        totalClaimed += actuallyReceived;
+
+        emit DividendClaimed(msg.sender, actuallyReceived);
     }
 
     function setExcludedFromDividends(address account, bool excluded) external onlyRole(OPERATOR_ROLE) {
         excludedFromDividends[account] = excluded;
+        if (excluded) {
+            _applyShareChange(account, 0);
+        }
+        emit Excluded(account, excluded);
     }
 
-    function emergencyWithdrawToken(address token, uint256 amount, address to) external onlyRole(OPERATOR_ROLE) {
-        bool ok = IERC20(token).transfer(to, amount);
-        require(ok, "transfer failed");
+    function emergencyWithdrawToken(address token, uint256 amount, address to) external onlyGuardian {
+        uint256 balance = IERC20(token).balanceOf(address(this));
+        uint256 reserved = token == dividendToken && totalDeposited > totalClaimed ? totalDeposited - totalClaimed : 0;
+        uint256 available = balance > reserved ? balance - reserved : 0;
+        require(amount <= available, "amount exceeds surplus; would touch reserved dividends");
+
+        IERC20(token).safeTransfer(to, amount);
+        emit EmergencyWithdraw(token, amount, to);
     }
 
-    function emergencyWithdrawNative(uint256 amount, address to) external onlyRole(OPERATOR_ROLE) {
+    function emergencyWithdrawNative(uint256 amount, address to) external onlyGuardian {
+        uint256 available = address(this).balance > pendingBnb ? address(this).balance - pendingBnb : 0;
+        require(amount <= available, "amount exceeds surplus; would touch pending dividend revenue");
+
         (bool ok,) = to.call{value: amount}("");
         require(ok, "withdraw failed");
+        emit EmergencyWithdraw(address(0), amount, to);
     }
 
     function description() public pure override returns (string memory) {
@@ -241,10 +396,7 @@ contract CustomDividendVaultFactory is VaultFactoryBaseV2 {
         pancakeRouter = _pancakeRouter;
     }
 
-    /// @dev IMPORTANT (per IVaultFactory.sol): `taxToken` is a PREDICTED
-    ///      address — the actual token contract does not exist yet when
-    ///      this runs. Do not call any function on `taxToken` here.
-    ///      vaultData = abi.encode(address dividendToken, uint256 minimumShareBalance)
+    /// @dev vaultData = abi.encode(address dividendToken, uint256 minimumShareBalance)
     function newVault(address taxToken, address quoteToken, address, /* creator */ bytes calldata vaultData)
         external
         override
@@ -262,6 +414,11 @@ contract CustomDividendVaultFactory is VaultFactoryBaseV2 {
 
     function isQuoteTokenSupported(address quoteToken) external pure override returns (bool supported) {
         supported = quoteToken == address(0);
+    }
+
+    /// @dev BOTH-11: v2.3 so the VaultPortal applies the V3 validation flow.
+    function factorySpecVersion() public pure override returns (string memory) {
+        return "v2.3";
     }
 
     function vaultDataSchema() public pure override returns (VaultDataSchema memory schema) {

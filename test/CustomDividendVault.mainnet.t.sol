@@ -10,9 +10,11 @@ import {CustomDividendVault, CustomDividendVaultFactory} from "src/CustomDividen
 /// @dev Minimal mock ERC20 standing in for a real Flap tax token. We only
 ///      need balanceOf() to drive the dividend share math — we are not
 ///      testing the tax token's own transfer/tax logic here, only that our
-///      vault correctly reads balances and pays out accordingly.
+///      vault correctly reads balances and pays out accordingly. Also
+///      exposes a settable mainPool() to test pair-exclusion (BOTH-03).
 contract MockTaxToken {
     mapping(address => uint256) public balanceOf;
+    address public mainPool;
 
     function mint(address to, uint256 amount) external {
         balanceOf[to] += amount;
@@ -20,6 +22,10 @@ contract MockTaxToken {
 
     function setBalance(address who, uint256 amount) external {
         balanceOf[who] = amount;
+    }
+
+    function setMainPool(address pool) external {
+        mainPool = pool;
     }
 }
 
@@ -29,6 +35,7 @@ contract CustomDividendVaultTest is Test {
     address internal constant PANCAKE_ROUTER_V2 = 0x10ED43C718714eb63d5aA57B78B54704E256024E;
     address internal constant CAKE = 0x0E09FaBB73Bd3Ade0a17ECC321fD13a19e81cE82;
     address internal constant VAULT_PORTAL_BSC = 0x90497450f2a706f1951b5bdda52B4E5d16f34C06;
+    address internal constant GUARDIAN_BSC = 0x9e27098dcD8844bcc6287a557E0b4D09C86B8a4b;
 
     address internal constant USER1 = address(0xCAFE1);
     address internal constant USER2 = address(0xCAFE2);
@@ -53,6 +60,15 @@ contract CustomDividendVaultTest is Test {
         vault = CustomDividendVault(payable(vaultAddr));
     }
 
+    /// @dev Funds the vault and immediately processes it — the standard
+    ///      two-step flow now that receive() only accumulates (BOTH-01 fix).
+    function _fundAndProcess(uint256 amount) internal {
+        vm.deal(address(this), amount);
+        (bool ok,) = address(vault).call{value: amount}("");
+        assertTrue(ok, "receive() should never revert");
+        vault.processPendingRevenue();
+    }
+
     // ------------------------------------------------------------------
     // 1. Factory deploys a correctly wired vault
     // ------------------------------------------------------------------
@@ -60,6 +76,11 @@ contract CustomDividendVaultTest is Test {
         assertEq(vault.taxToken(), address(taxToken), "taxToken mismatch");
         assertEq(vault.dividendToken(), CAKE, "dividendToken mismatch");
         assertEq(vault.pancakeRouter(), PANCAKE_ROUTER_V2, "router mismatch");
+        assertEq(vault.vaultQuoteToken(), address(0), "native-only vault");
+    }
+
+    function test_factorySpecVersionIsV23() public view {
+        assertEq(factory.factorySpecVersion(), "v2.3", "BOTH-11: factory should advertise v2.3 for V3 vaults");
     }
 
     function test_factoryRejectsNonVaultPortalCaller() public {
@@ -76,20 +97,30 @@ contract CustomDividendVaultTest is Test {
     }
 
     // ------------------------------------------------------------------
-    // 2. Vault receives BNB and actually swaps it into the dividend token
+    // 2. receive() accumulates only; processPendingRevenue() does the swap
     // ------------------------------------------------------------------
-    function test_receiveSwapsBnbIntoDividendToken() public {
+    function test_receiveOnlyAccumulatesNeverSwaps() public {
         taxToken.mint(USER1, 100 ether);
         vault.syncShare(USER1);
-
-        uint256 vaultCakeBefore = IERC20(CAKE).balanceOf(address(vault));
 
         vm.deal(address(this), 1 ether);
         (bool ok,) = address(vault).call{value: 1 ether}("");
         assertTrue(ok, "receive() should accept BNB");
 
+        assertEq(vault.pendingBnb(), 1 ether, "receive() must only accumulate into pendingBnb");
+        assertEq(IERC20(CAKE).balanceOf(address(vault)), 0, "receive() must never swap (BOTH-01 fix)");
+    }
+
+    function test_processPendingRevenueSwapsBnbIntoDividendToken() public {
+        taxToken.mint(USER1, 100 ether);
+        vault.syncShare(USER1);
+
+        uint256 vaultCakeBefore = IERC20(CAKE).balanceOf(address(vault));
+        _fundAndProcess(1 ether);
         uint256 vaultCakeAfter = IERC20(CAKE).balanceOf(address(vault));
+
         assertGt(vaultCakeAfter, vaultCakeBefore, "vault should have received CAKE from the swap");
+        assertEq(vault.pendingBnb(), 0, "pendingBnb should be drained after processing");
     }
 
     function test_revenueBeforeAnySyncIsParkedNotLost() public {
@@ -98,20 +129,14 @@ contract CustomDividendVaultTest is Test {
         (bool ok,) = address(vault).call{value: 1 ether}("");
         assertTrue(ok);
 
-        // Correct behavior: BNB is parked, NOT swapped, while nobody is
-        // known yet — swapping here would orphan the proceeds permanently
-        // (no share to attribute them to). This used to silently swap and
-        // lose the funds; caught by a deeper test pass, fixed below.
-        assertEq(address(vault).balance, 1 ether, "should be parked as native BNB");
+        assertEq(vault.pendingBnb(), 1 ether, "should be parked as pendingBnb");
         assertEq(IERC20(CAKE).balanceOf(address(vault)), 0, "must not swap into an orphaned deposit");
 
-        // Now a holder shows up and gets synced.
         taxToken.mint(USER1, 100 ether);
         vault.syncShare(USER1);
 
-        // Unstick the parked funds.
         vault.processPendingRevenue();
-        assertEq(address(vault).balance, 0, "parked BNB should now be converted");
+        assertEq(vault.pendingBnb(), 0, "parked BNB should now be converted");
         assertGt(vault.withdrawableDividendOf(USER1), 0, "USER1 should now be able to claim the previously-parked funds");
     }
 
@@ -130,9 +155,7 @@ contract CustomDividendVaultTest is Test {
         taxToken.mint(USER1, 100 ether);
         vault.syncShare(USER1);
 
-        vm.deal(address(this), 2 ether);
-        (bool ok,) = address(vault).call{value: 2 ether}("");
-        assertTrue(ok);
+        _fundAndProcess(2 ether);
 
         uint256 pending = vault.withdrawableDividendOf(USER1);
         assertGt(pending, 0, "USER1 should have pending dividends");
@@ -159,9 +182,7 @@ contract CustomDividendVaultTest is Test {
         taxToken.mint(USER1, 100 ether);
         vault.syncShare(USER1);
 
-        vm.deal(address(this), 1 ether);
-        (bool ok,) = address(vault).call{value: 1 ether}("");
-        assertTrue(ok);
+        _fundAndProcess(1 ether);
 
         vm.prank(USER1);
         vault.claim();
@@ -180,24 +201,64 @@ contract CustomDividendVaultTest is Test {
         vault.syncShare(USER1);
         vault.syncShare(USER2);
 
-        vm.deal(address(this), 4 ether);
-        (bool ok,) = address(vault).call{value: 4 ether}("");
-        assertTrue(ok);
+        _fundAndProcess(4 ether);
 
         uint256 pending1 = vault.withdrawableDividendOf(USER1);
         uint256 pending2 = vault.withdrawableDividendOf(USER2);
 
-        // USER1 should have roughly 3x USER2's share (within rounding dust).
         assertApproxEqRel(pending1, pending2 * 3, 0.01e18, "dividend split should be proportional to balance");
     }
 
     // ------------------------------------------------------------------
-    // 5. Guardian-gated admin functions
+    // 5. SECURITY FIX (IBV-01 pattern applied here too): emergency withdraw
+    //    is Guardian-only via an explicit address check, not just role-based
+    //    (defense-in-depth — CDV never granted a team role in the first
+    //    place, so this closes the gap for consistency rather than an
+    //    actual live exploit in this specific vault).
     // ------------------------------------------------------------------
     function test_nonGuardianCannotCallEmergencyWithdraw() public {
-        vm.expectRevert();
+        vm.expectRevert(CustomDividendVault.GuardianOnly.selector);
         vm.prank(ATTACKER);
         vault.emergencyWithdrawNative(1 ether, ATTACKER);
+    }
+
+    function test_guardianCanWithdrawGenuineSurplus() public {
+        // Send to a plain address, not the Guardian multisig itself — that's
+        // a real contract on the mainnet fork that rejects bare ETH transfers
+        // with no calldata. Guardian is the CALLER here (authorization), the
+        // recipient can be anyone the Guardian chooses.
+        address recipient = address(0xC0FFEE);
+        vm.deal(address(vault), 1 ether); // bypasses receive(), so pendingBnb stays 0
+        assertEq(vault.pendingBnb(), 0);
+
+        uint256 balBefore = recipient.balance;
+        vm.prank(GUARDIAN_BSC);
+        vault.emergencyWithdrawNative(1 ether, recipient);
+        assertEq(recipient.balance, balBefore + 1 ether);
+    }
+
+    function test_guardianCannotWithdrawPendingBnb() public {
+        vm.deal(address(this), 1 ether);
+        (bool ok,) = address(vault).call{value: 1 ether}("");
+        assertTrue(ok);
+        assertEq(vault.pendingBnb(), 1 ether);
+
+        vm.expectRevert(bytes("amount exceeds surplus; would touch pending dividend revenue"));
+        vm.prank(GUARDIAN_BSC);
+        vault.emergencyWithdrawNative(1 ether, GUARDIAN_BSC);
+    }
+
+    function test_guardianCannotWithdrawReservedDividends() public {
+        taxToken.mint(USER1, 100 ether);
+        vault.syncShare(USER1);
+        _fundAndProcess(1 ether);
+
+        uint256 cakeBalance = IERC20(CAKE).balanceOf(address(vault));
+        assertGt(cakeBalance, 0, "sanity: vault should hold CAKE owed to USER1");
+
+        vm.expectRevert(bytes("amount exceeds surplus; would touch reserved dividends"));
+        vm.prank(GUARDIAN_BSC);
+        vault.emergencyWithdrawToken(CAKE, cakeBalance, GUARDIAN_BSC);
     }
 
     function test_nonGuardianCannotExcludeAddresses() public {
@@ -207,31 +268,73 @@ contract CustomDividendVaultTest is Test {
     }
 
     function test_guardianRoleCannotBeRevoked() public {
-        address guardian = _guardianAddress();
-        bytes32 operatorRole = vault.OPERATOR_ROLE(); // read BEFORE pranking — see prank convention note
+        bytes32 operatorRole = vault.OPERATOR_ROLE();
 
-        vm.prank(guardian);
+        vm.prank(GUARDIAN_BSC);
         vm.expectRevert(CustomDividendVault.CannotRevokeGuardianRole.selector);
-        vault.revokeRole(operatorRole, guardian);
-    }
-
-    function _guardianAddress() internal pure returns (address) {
-        // BNB Chain Guardian, hardcoded in VaultBase.sol — this test runs
-        // with vm.chainid defaulting to whatever forge sets for a BSC fork.
-        return 0x9e27098dcD8844bcc6287a557E0b4D09C86B8a4b;
+        vault.revokeRole(operatorRole, GUARDIAN_BSC);
     }
 
     // ------------------------------------------------------------------
     // 6. Excluded addresses never accrue share
     // ------------------------------------------------------------------
     function test_excludedAddressDoesNotAccrueDividends() public {
-        address guardian = _guardianAddress();
-
         taxToken.mint(USER1, 100 ether);
-        vm.prank(guardian);
+        vm.prank(GUARDIAN_BSC);
         vault.setExcludedFromDividends(USER1, true);
 
         vault.syncShare(USER1);
         assertEq(vault.totalEligibleSupply(), 0, "excluded address should not count toward eligible supply");
+    }
+
+    // ------------------------------------------------------------------
+    // 6b. SECURITY FIX (BOTH-04): excluding an ALREADY-synced address
+    //     actually zeroes their share immediately.
+    // ------------------------------------------------------------------
+    function test_excludingAlreadySyncedHolderZeroesShareImmediately() public {
+        taxToken.mint(USER1, 100 ether);
+        vault.syncShare(USER1);
+        assertEq(vault.totalEligibleSupply(), 100 ether);
+
+        vm.prank(GUARDIAN_BSC);
+        vault.setExcludedFromDividends(USER1, true);
+
+        assertEq(vault.totalEligibleSupply(), 0, "excluding an already-synced holder must zero their share now");
+    }
+
+    // ------------------------------------------------------------------
+    // 6c. SECURITY FIX (BOTH-03, BOTH-12): protected addresses can never
+    //     accrue a share, even without ever calling setExcludedFromDividends.
+    // ------------------------------------------------------------------
+    function test_vaultItselfNeverAccrues() public {
+        taxToken.mint(address(vault), 999 ether);
+        vault.syncShare(address(vault));
+        assertEq(vault.totalEligibleSupply(), 0, "the vault itself must never count as a holder");
+    }
+
+    function test_taxTokenMainPoolNeverAccrues() public {
+        address fakePair = address(0xFACADE);
+        taxToken.setMainPool(fakePair);
+        taxToken.mint(fakePair, 999 ether);
+
+        vm.prank(ATTACKER); // permissionless sync, even from an attacker, is harmless
+        vault.syncShare(fakePair);
+        assertEq(vault.totalEligibleSupply(), 0, "taxToken's own trading pair must never count as a holder (BOTH-03)");
+    }
+
+    // ------------------------------------------------------------------
+    // 7. SECURITY FIX (BOTH-02, BOTH-07): swap safety parameters
+    // ------------------------------------------------------------------
+    function test_operatorCannotExceedSlippageCeiling() public {
+        vm.prank(GUARDIAN_BSC);
+        vm.expectRevert(bytes("slippage above safety ceiling"));
+        vault.setMaxSlippageBps(2001);
+    }
+
+    function test_swapStillSucceedsWithDefaultSlippageProtection() public {
+        taxToken.mint(USER1, 100 ether);
+        vault.syncShare(USER1);
+        _fundAndProcess(1 ether);
+        assertGt(vault.withdrawableDividendOf(USER1), 0, "swap should still succeed with slippage protection on");
     }
 }

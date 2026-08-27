@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.13;
 
-import {VaultBaseV2} from "./flap/VaultBaseV2.sol";
+import {VaultBaseV3} from "./flap/VaultBaseV3.sol";
 import {VaultFactoryBaseV2} from "./flap/VaultFactoryBaseV2.sol";
-import {IVaultFactoryValidationV2} from "./flap/IVaultFactory.sol";
 import {
     VaultUISchema,
     VaultMethodSchema,
@@ -13,6 +12,7 @@ import {
 } from "./flap/IVaultSchemasV1.sol";
 
 import {IERC20} from "@openzeppelin/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/token/ERC20/utils/SafeERC20.sol";
 import {AccessControl} from "@openzeppelin/access/AccessControl.sol";
 import {ReentrancyGuard} from "@openzeppelin/security/ReentrancyGuard.sol";
 
@@ -25,6 +25,24 @@ interface IPancakeRouter {
     ) external payable;
 
     function WETH() external pure returns (address);
+    function factory() external pure returns (address);
+    function getAmountsOut(uint256 amountIn, address[] calldata path)
+        external
+        view
+        returns (uint256[] memory amounts);
+}
+
+interface IPancakeFactoryMinimal {
+    function getPair(address tokenA, address tokenB) external view returns (address pair);
+}
+
+interface IPancakePairMinimal {
+    function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
+    function token0() external view returns (address);
+}
+
+interface ITaxTokenMainPool {
+    function mainPool() external view returns (address);
 }
 
 /// @title IndexBasketVault
@@ -35,22 +53,78 @@ interface IPancakeRouter {
 ///         team (OPERATOR_ROLE) — this contract does not attempt on-chain
 ///         "top runners" discovery or rug-filtering, since that judgment
 ///         cannot be done reliably on-chain.
-/// @dev Share sync model matches CustomDividendVault: a holder's share is
-///      refreshed to their current taxToken balance at claim() time (or via
-///      permissionless syncShare()), not on every transfer — see prior
-///      discussion on why custom vaults can't get Dust's live transfer hook.
+/// @dev SECURITY NOTE (post-review, see flap-vault-contracts-security-review.md):
+///      Pass 1 fixes (Critical/High): receive()-only-accumulates (BOTH-01,
+///      IBV-04), slippage floor + reserve cap + threshold (BOTH-02, BOTH-07),
+///      Guardian-only emergency with reserved-balance protection (IBV-01,
+///      BOTH-10), hard-excluded protected addresses (BOTH-03, BOTH-04, BOTH-12).
+///      Pass 2 fixes (this revision):
+///        - IBV-03: basket can be set atomically at construction via
+///          `vaultData`, and `updateBasket` now enforces a minimum cooldown —
+///          no more "empty basket, then delayed dump into whatever the team
+///          picks" launch-window pattern.
+///        - IBV-02: pending BNB is tracked PER BASKET TOKEN
+///          (`pendingBnbByToken`), computed at receive() time using the
+///          weights in effect then. A token that fails to swap keeps its own
+///          isolated leftover — it no longer bleeds into other tokens'
+///          weights on the next processing round.
+///        - BOTH-09: all token payouts use OpenZeppelin `SafeERC20` (handles
+///          tokens that don't return a bool) and measure the ACTUAL amount
+///          received via balance delta rather than trusting the requested
+///          amount — a fee-on-transfer reward token can no longer cause a
+///          silent accounting/balance mismatch.
+///        - BOTH-11 (partial): now extends `VaultBaseV3` and declares
+///          `vaultQuoteToken() == address(0)` (native); factory advertises
+///          `factorySpecVersion() == "v2.3"`. Custom-error-vs-require-string
+///          (Flap UI-01) and `autoForwardEnabled`/`forwardAddress` are NOT
+///          addressed in this revision — tracked separately.
+///      Not yet applied: IBV-05 (unbounded `allRewardTokens` growth — no
+///      pagination added yet; document the growth cost instead), BOTH-13/14
+///      hardening.
+/// @dev Share sync model: a holder's share is refreshed to their current
+///      taxToken balance at claim()/sync time, not on every transfer — this
+///      vault cannot hook taxToken transfers (BOTH-05). Dividends are NOT a
+///      live pro-rata snapshot; they lag behind actual holding changes until
+///      someone triggers a sync (self-claim, a keeper's distributeTo(), or an
+///      explicit syncShare() call). Run a keeper (see the companion
+///      dividend-bot) that periodically calls distributeTo() with the current
+///      holder list to keep this current in practice.
 ///      Changing the basket does NOT liquidate previously-acquired reward
 ///      tokens; past accruals remain claimable in their original denomination.
-contract IndexBasketVault is VaultBaseV2, AccessControl, ReentrancyGuard {
+contract IndexBasketVault is VaultBaseV3, AccessControl, ReentrancyGuard {
+    using SafeERC20 for IERC20;
+
     bytes32 public constant OPERATOR_ROLE = keccak256("OPERATOR_ROLE");
     uint256 private constant MAGNITUDE = 2 ** 128;
     uint256 private constant MAX_BASKET_SIZE = 5;
     uint16 private constant BPS_DENOMINATOR = 10000;
+    uint16 private constant MAX_SLIPPAGE_BPS_CEILING = 2000; // hard safety rail: never allow >20%
+    uint16 private constant MAX_RESERVE_IMPACT_BPS_CEILING = 1000; // hard safety rail: never allow >10% of reserves per swap
+    uint256 public constant MIN_BASKET_UPDATE_COOLDOWN = 1 hours;
 
     address public taxToken;
     address public pancakeRouter;
     uint256 public minimumShareBalance;
     uint256 public totalEligibleSupply;
+
+    /// @notice BNB collected while no basket existed yet — split into
+    ///         `pendingBnbByToken` using CURRENT weights the next time
+    ///         processPendingRevenue() runs (there's no prior allocation to
+    ///         preserve fairness against, since no basket existed when it
+    ///         arrived).
+    uint256 public pendingBnbNoBasket;
+    /// @notice BNB queued per basket token, allocated at receive() time using
+    ///         the weights in effect then (IBV-02) — isolated per token so a
+    ///         dead/failing token's leftover never bleeds into another
+    ///         token's share on a later processing round.
+    mapping(address => uint256) public pendingBnbByToken;
+
+    uint256 public minBnbToProcess;
+    uint16 public maxSlippageBps = 500; // 5% default
+    uint16 public maxReserveImpactBps = 200; // 2% of WBNB pair reserve per swap, default
+
+    uint256 public lastBasketUpdateTime;
+    uint256 public basketUpdateCooldown = MIN_BASKET_UPDATE_COOLDOWN;
 
     address[] public basketTokens;
     mapping(address => uint16) public basketWeightBps;
@@ -64,6 +138,12 @@ contract IndexBasketVault is VaultBaseV2, AccessControl, ReentrancyGuard {
     mapping(address => uint256) private lastSyncedBalance; // user => synced taxToken balance
     mapping(address => bool) public excludedFromDividends;
 
+    /// @notice Lifetime accounting per reward token, used to compute how much
+    ///         of the vault's balance is "reserved" (owed to holders) and
+    ///         therefore off-limits to emergencyWithdrawToken.
+    mapping(address => uint256) public totalDeposited;
+    mapping(address => uint256) public totalClaimed;
+
     bool private initialized;
 
     event BasketUpdated(address[] tokens, uint16[] weightsBps);
@@ -71,15 +151,34 @@ contract IndexBasketVault is VaultBaseV2, AccessControl, ReentrancyGuard {
     event DividendClaimed(address indexed user, address indexed token, uint256 amount);
     event ShareSynced(address indexed user, uint256 newShare);
     event SwapFailed(address indexed token, uint256 bnbAmount);
+    event SwapSkipped(address indexed token, uint256 bnbAmount, string reason);
+    event Excluded(address indexed account, bool excluded);
+    event EmergencyWithdraw(address indexed token, uint256 amount, address indexed to);
 
     error AlreadyInitialized();
     error InvalidBasket();
     error NothingToClaim();
     error CannotRevokeGuardianRole();
+    error GuardianOnly();
+    error BasketUpdateCooldownActive();
 
-    function initializeVault(address _taxToken, address _pancakeRouter, address _teamOperator, uint256 _minimumShareBalance)
-        external
-    {
+    modifier onlyGuardian() {
+        if (msg.sender != _getGuardian()) revert GuardianOnly();
+        _;
+    }
+
+    /// @param initialTokens Optional initial basket (can be empty — team then
+    ///        calls updateBasket() separately, subject to the same cooldown
+    ///        starting from deployment). Passing it here avoids the
+    ///        empty-basket launch window entirely (IBV-03).
+    function initializeVault(
+        address _taxToken,
+        address _pancakeRouter,
+        address _teamOperator,
+        uint256 _minimumShareBalance,
+        address[] calldata initialTokens,
+        uint16[] calldata initialWeights
+    ) external {
         if (initialized) revert AlreadyInitialized();
         initialized = true;
 
@@ -90,9 +189,15 @@ contract IndexBasketVault is VaultBaseV2, AccessControl, ReentrancyGuard {
         address guardian = _getGuardian();
         _grantRole(DEFAULT_ADMIN_ROLE, guardian);
         _grantRole(OPERATOR_ROLE, guardian);
+        // SECURITY FIX (IBV-01): team gets OPERATOR_ROLE only — never
+        // DEFAULT_ADMIN_ROLE — and emergency withdrawals are gated by
+        // onlyGuardian, not OPERATOR_ROLE, so this can't be used to drain.
         if (_teamOperator != address(0)) {
-            _grantRole(DEFAULT_ADMIN_ROLE, _teamOperator);
             _grantRole(OPERATOR_ROLE, _teamOperator);
+        }
+
+        if (initialTokens.length > 0) {
+            _setBasket(initialTokens, initialWeights);
         }
     }
 
@@ -101,30 +206,59 @@ contract IndexBasketVault is VaultBaseV2, AccessControl, ReentrancyGuard {
         super.revokeRole(role, account);
     }
 
+    /// @notice Native-only vault: this instance always accounts revenue in
+    ///         the chain's native gas token (BNB), never an ERC20 quote.
+    function vaultQuoteToken() public pure override returns (address) {
+        return address(0);
+    }
+
     // ------------------------------------------------------------------
     // Basket management — team sets which tokens are in the index right now
     // ------------------------------------------------------------------
 
     /// @notice Replace the current basket. Does not touch previously-acquired
     ///         reward tokens — those stay claimable at their old accrual rate.
-    /// @param tokens Up to 5 token addresses, no duplicates, no zero address.
-    /// @param weightsBps Matching weights in basis points; must sum to 10000.
+    ///         SECURITY FIX (IBV-03): rate-limited by `basketUpdateCooldown`
+    ///         so the team cannot rapidly swap the basket right after launch
+    ///         (or at any other moment) faster than holders can notice.
+    /// @param tokens Up to 5 token addresses, no duplicates, no zero address,
+    ///        and none of {taxToken, this vault, the router, WBNB} (IBV-04).
+    /// @param weightsBps Matching weights in basis points; must sum to 10000,
+    ///        and every individual weight must be > 0 (IBV-07).
     function updateBasket(address[] calldata tokens, uint16[] calldata weightsBps) external onlyRole(OPERATOR_ROLE) {
+        // forge-lint: disable-next-line(block-timestamp)
+        // Validators can nudge block.timestamp by a few seconds; irrelevant
+        // against a cooldown measured in hours (MIN_BASKET_UPDATE_COOLDOWN).
+        if (block.timestamp < lastBasketUpdateTime + basketUpdateCooldown) revert BasketUpdateCooldownActive();
+        _setBasket(tokens, weightsBps);
+    }
+
+    function setBasketUpdateCooldown(uint256 cooldown) external onlyRole(OPERATOR_ROLE) {
+        require(cooldown >= MIN_BASKET_UPDATE_COOLDOWN, "cooldown below minimum");
+        basketUpdateCooldown = cooldown;
+    }
+
+    function _setBasket(address[] calldata tokens, uint16[] calldata weightsBps) internal {
         if (tokens.length == 0 || tokens.length > MAX_BASKET_SIZE || tokens.length != weightsBps.length) {
             revert InvalidBasket();
         }
 
+        address weth = IPancakeRouter(pancakeRouter).WETH();
+
         uint16 total;
         for (uint256 i = 0; i < weightsBps.length; i++) {
+            if (weightsBps[i] == 0) revert InvalidBasket();
             total += weightsBps[i];
-            if (tokens[i] == address(0)) revert InvalidBasket();
+            if (
+                tokens[i] == address(0) || tokens[i] == taxToken || tokens[i] == address(this)
+                    || tokens[i] == pancakeRouter || tokens[i] == weth
+            ) revert InvalidBasket();
             for (uint256 j = i + 1; j < tokens.length; j++) {
                 if (tokens[i] == tokens[j]) revert InvalidBasket();
             }
         }
         if (total != BPS_DENOMINATOR) revert InvalidBasket();
 
-        // clear old weights so a token dropped from the basket stops accruing
         for (uint256 i = 0; i < basketTokens.length; i++) {
             basketWeightBps[basketTokens[i]] = 0;
         }
@@ -136,6 +270,7 @@ contract IndexBasketVault is VaultBaseV2, AccessControl, ReentrancyGuard {
             _registerRewardToken(tokens[i]);
         }
 
+        lastBasketUpdateTime = block.timestamp;
         emit BasketUpdated(tokens, weightsBps);
     }
 
@@ -154,80 +289,207 @@ contract IndexBasketVault is VaultBaseV2, AccessControl, ReentrancyGuard {
         return allRewardTokens.length;
     }
 
-    // ------------------------------------------------------------------
-    // Receives tax revenue, splits it across the basket by weight, swaps
-    // ------------------------------------------------------------------
-    receive() external payable {
-        // If nobody has been synced yet, totalEligibleSupply is 0 — swapping
-        // now would permanently orphan the proceeds (no share to attribute
-        // them to). Just let the BNB sit here; call processPendingRevenue()
-        // once at least one holder has been synced (e.g. after the first
-        // claim or the first distributeTo run) to convert it retroactively.
-        if (totalEligibleSupply == 0) return;
-        _processBnbBalance();
-    }
-
-    /// @notice Manually triggers conversion of whatever native BNB is
-    ///         currently sitting in the vault into the basket, using the
-    ///         CURRENT totalEligibleSupply. Exists to unstick funds that
-    ///         arrived via receive() while totalEligibleSupply was still 0
-    ///         (e.g. tax dispatched before the first holder was ever synced).
-    ///         Permissionless — anyone can call it, there's no way to misuse
-    ///         it to redirect funds anywhere but the existing basket.
-    function processPendingRevenue() external nonReentrant {
-        require(totalEligibleSupply > 0, "no eligible holders yet");
-        require(address(this).balance > 0, "nothing pending");
-        _processBnbBalance();
-    }
-
-    function _processBnbBalance() internal {
-        uint256 balance = address(this).balance;
-        if (balance == 0 || basketTokens.length == 0) return;
-
-        for (uint256 i = 0; i < basketTokens.length; i++) {
-            address token = basketTokens[i];
-            uint256 share = (balance * basketWeightBps[token]) / BPS_DENOMINATOR;
-            if (share == 0) continue;
-            _swapAndDeposit(token, share);
+    /// @notice Sum of all BNB queued for swapping — the pre-basket bucket
+    ///         plus every basket-token-specific bucket. Convenience view for
+    ///         keepers/UIs; the per-token detail is in `pendingBnbByToken`.
+    function totalPendingBnb() external view returns (uint256 total) {
+        total = pendingBnbNoBasket;
+        for (uint256 i = 0; i < allRewardTokens.length; i++) {
+            total += pendingBnbByToken[allRewardTokens[i]];
         }
     }
 
-    function _swapAndDeposit(address token, uint256 bnbAmount) internal {
+    // ------------------------------------------------------------------
+    // Swap safety parameters — operator-tunable within hard-coded ceilings
+    // ------------------------------------------------------------------
+    function setMaxSlippageBps(uint16 bps) external onlyRole(OPERATOR_ROLE) {
+        require(bps <= MAX_SLIPPAGE_BPS_CEILING, "slippage above safety ceiling");
+        maxSlippageBps = bps;
+    }
+
+    function setMaxReserveImpactBps(uint16 bps) external onlyRole(OPERATOR_ROLE) {
+        require(bps <= MAX_RESERVE_IMPACT_BPS_CEILING, "impact above safety ceiling");
+        maxReserveImpactBps = bps;
+    }
+
+    function setMinBnbToProcess(uint256 amount) external onlyRole(OPERATOR_ROLE) {
+        minBnbToProcess = amount;
+    }
+
+    // ------------------------------------------------------------------
+    // Receives tax revenue — accumulates ONLY, never swaps here (BOTH-01).
+    // Per Flap VaultBaseV3's ping contract: keep this lightweight (storage
+    // writes only, no external calls) so a heavy vault never makes the
+    // protocol's keeper's dispatch fail for this token.
+    // ------------------------------------------------------------------
+    receive() external payable nonReentrant {
+        if (basketTokens.length == 0) {
+            pendingBnbNoBasket += msg.value;
+            return;
+        }
+
+        uint256 allocated;
+        for (uint256 i = 0; i < basketTokens.length; i++) {
+            address token = basketTokens[i];
+            uint256 share = (msg.value * basketWeightBps[token]) / BPS_DENOMINATOR;
+            pendingBnbByToken[token] += share;
+            allocated += share;
+        }
+        // Rounding dust (division truncation) — negligible, kept so no wei
+        // is ever silently lost.
+        if (msg.value > allocated) {
+            pendingBnbNoBasket += (msg.value - allocated);
+        }
+    }
+
+    /// @notice Manually triggers conversion of whatever native BNB is queued
+    ///         into the basket, using CURRENT totalEligibleSupply. This is
+    ///         the only place swaps happen. Permissionless — anyone (a
+    ///         keeper bot, the team, a holder) can call it; the caller just
+    ///         pays gas.
+    function processPendingRevenue() external nonReentrant {
+        require(totalEligibleSupply > 0, "no eligible holders yet");
+        require(basketTokens.length > 0, "no basket set");
+
+        // Carry forward any pre-basket accumulation using CURRENT weights.
+        if (pendingBnbNoBasket > 0) {
+            uint256 carry = pendingBnbNoBasket;
+            pendingBnbNoBasket = 0;
+            uint256 allocated;
+            for (uint256 i = 0; i < basketTokens.length; i++) {
+                address token = basketTokens[i];
+                uint256 share = (carry * basketWeightBps[token]) / BPS_DENOMINATOR;
+                pendingBnbByToken[token] += share;
+                allocated += share;
+            }
+            if (carry > allocated) {
+                pendingBnbNoBasket += (carry - allocated);
+            }
+        }
+
+        bool processedAny;
+        for (uint256 i = 0; i < basketTokens.length; i++) {
+            address token = basketTokens[i];
+            uint256 amount = pendingBnbByToken[token];
+            if (amount == 0 || amount < minBnbToProcess) continue;
+
+            pendingBnbByToken[token] = 0;
+            uint256 processed = _swapAndDeposit(token, amount);
+            uint256 leftover = amount - processed;
+            if (leftover > 0) {
+                // SECURITY FIX (IBV-02): stays isolated to THIS token's own
+                // bucket — never re-mixed into other tokens' weights.
+                pendingBnbByToken[token] += leftover;
+            }
+            processedAny = true;
+        }
+
+        require(processedAny, "nothing pending");
+    }
+
+    function _swapAndDeposit(address token, uint256 bnbAmount) internal returns (uint256 processed) {
+        address weth = IPancakeRouter(pancakeRouter).WETH();
+
+        uint256 cappedAmount = _capAgainstReserves(token, weth, bnbAmount);
+        if (cappedAmount == 0) {
+            emit SwapSkipped(token, bnbAmount, "capped to zero (no/low liquidity)");
+            return 0;
+        }
+
         address[] memory path = new address[](2);
-        path[0] = IPancakeRouter(pancakeRouter).WETH();
+        path[0] = weth;
         path[1] = token;
+
+        uint256 minOut;
+        try IPancakeRouter(pancakeRouter).getAmountsOut(cappedAmount, path) returns (uint256[] memory amounts) {
+            uint256 expectedOut = amounts[amounts.length - 1];
+            minOut = (expectedOut * (BPS_DENOMINATOR - maxSlippageBps)) / BPS_DENOMINATOR;
+        } catch {
+            emit SwapFailed(token, cappedAmount);
+            return 0;
+        }
 
         uint256 balBefore = IERC20(token).balanceOf(address(this));
 
-        try IPancakeRouter(pancakeRouter).swapExactETHForTokensSupportingFeeOnTransferTokens{value: bnbAmount}(
-            0, path, address(this), block.timestamp + 300
+        try IPancakeRouter(pancakeRouter).swapExactETHForTokensSupportingFeeOnTransferTokens{value: cappedAmount}(
+            minOut, path, address(this), block.timestamp + 300
         ) {
             uint256 received = IERC20(token).balanceOf(address(this)) - balBefore;
             if (received > 0 && totalEligibleSupply > 0) {
                 magnifiedDividendPerShare[token] += (received * MAGNITUDE) / totalEligibleSupply;
-                emit DividendsDeposited(token, bnbAmount, received);
+                totalDeposited[token] += received;
+                emit DividendsDeposited(token, cappedAmount, received);
             }
+            processed = cappedAmount;
         } catch {
-            // Don't let one bad token in the basket brick tax dispatch for the
-            // others — funds simply stay as BNB in the vault. Team can retry
-            // via emergencyWithdrawNative + manual handling if this persists.
-            emit SwapFailed(token, bnbAmount);
+            emit SwapFailed(token, cappedAmount);
+            processed = 0;
+        }
+    }
+
+    /// @dev Caps a swap to at most `maxReserveImpactBps` of the target pair's
+    ///      WBNB reserve, to bound price impact / dump size (BOTH-07).
+    function _capAgainstReserves(address token, address weth, uint256 bnbAmount) internal view returns (uint256) {
+        address factory;
+        try IPancakeRouter(pancakeRouter).factory() returns (address f) {
+            factory = f;
+        } catch {
+            return bnbAmount;
+        }
+
+        address pair;
+        try IPancakeFactoryMinimal(factory).getPair(weth, token) returns (address p) {
+            pair = p;
+        } catch {
+            return bnbAmount;
+        }
+        if (pair == address(0)) return bnbAmount;
+
+        try IPancakePairMinimal(pair).getReserves() returns (uint112 r0, uint112 r1, uint32) {
+            address token0;
+            try IPancakePairMinimal(pair).token0() returns (address t0) {
+                token0 = t0;
+            } catch {
+                return bnbAmount;
+            }
+            uint256 wethReserve = token0 == weth ? uint256(r0) : uint256(r1);
+            uint256 cap = (wethReserve * maxReserveImpactBps) / BPS_DENOMINATOR;
+            return bnbAmount > cap ? cap : bnbAmount;
+        } catch {
+            return bnbAmount;
         }
     }
 
     // ------------------------------------------------------------------
-    // Share sync — same claim-time model as CustomDividendVault
+    // Share sync
     // ------------------------------------------------------------------
-    function syncShare(address user) public {
-        if (excludedFromDividends[user]) return;
+    function syncShare(address user) external nonReentrant {
+        _syncShare(user);
+    }
+
+    function _syncShare(address user) internal {
+        if (excludedFromDividends[user] || _isProtectedAddress(user)) {
+            _applyShareChange(user, 0);
+            return;
+        }
 
         uint256 newBalance = IERC20(taxToken).balanceOf(user);
         if (newBalance < minimumShareBalance) newBalance = 0;
+        _applyShareChange(user, newBalance);
+    }
 
+    function _isProtectedAddress(address a) internal view returns (bool) {
+        if (a == address(this) || a == taxToken || a == address(0) || a == address(0xdEaD)) return true;
+        try ITaxTokenMainPool(taxToken).mainPool() returns (address pool) {
+            if (pool != address(0) && a == pool) return true;
+        } catch {}
+        return false;
+    }
+
+    function _applyShareChange(address user, uint256 newBalance) internal {
         uint256 oldBalance = lastSyncedBalance[user];
         if (newBalance == oldBalance) return;
 
-        // apply the same balance delta to every reward token's correction ledger
         for (uint256 i = 0; i < allRewardTokens.length; i++) {
             address token = allRewardTokens[i];
             if (newBalance > oldBalance) {
@@ -259,81 +521,101 @@ contract IndexBasketVault is VaultBaseV2, AccessControl, ReentrancyGuard {
     }
 
     /// @notice Claim pending dividends in a single reward token.
+    ///         SECURITY FIX (BOTH-09): uses SafeERC20 (survives tokens that
+    ///         don't return a bool) and measures the ACTUAL amount received
+    ///         via balance delta — a fee-on-transfer reward token can no
+    ///         longer create a silent gap between "accounted as paid" and
+    ///         "actually delivered". Under-delivered amounts simply remain
+    ///         claimable for next time.
     function claimToken(address token) public nonReentrant {
-        syncShare(msg.sender);
+        _syncShare(msg.sender);
         uint256 owed = withdrawableDividendOf(msg.sender, token);
         if (owed == 0) revert NothingToClaim();
 
-        withdrawnDividends[token][msg.sender] += owed;
-        bool ok = IERC20(token).transfer(msg.sender, owed);
-        require(ok, "transfer failed");
+        uint256 balBefore = IERC20(token).balanceOf(msg.sender);
+        IERC20(token).safeTransfer(msg.sender, owed);
+        uint256 actuallyReceived = IERC20(token).balanceOf(msg.sender) - balBefore;
 
-        emit DividendClaimed(msg.sender, token, owed);
+        withdrawnDividends[token][msg.sender] += actuallyReceived;
+        totalClaimed[token] += actuallyReceived;
+
+        emit DividendClaimed(msg.sender, token, actuallyReceived);
     }
 
-    /// @notice Claim pending dividends across every reward token ever used,
-    ///         including ones no longer in the active basket.
     function claimAll() external nonReentrant {
         if (!_claimAllFor(msg.sender)) revert NothingToClaim();
     }
 
-    /// @notice Permissionless push distribution — pays out every user in the
-    ///         list across all reward tokens in one transaction. Anyone can
-    ///         call this (team keeper, a bot, or a community member); the
-    ///         caller just pays the gas. One user having nothing pending, or
-    ///         one reward token failing to transfer to a given address (e.g.
-    ///         a blacklist on that specific token), does not block payouts
-    ///         to the rest of the batch.
-    /// @param users Addresses to push dividends to. Get this list off-chain
-    ///        (BscScan holder export, Bitquery, your own indexer) — the
-    ///        chain itself has no way to enumerate all taxToken holders.
+    /// @notice Permissionless push distribution. See claimToken's NatSpec for
+    ///         the SafeERC20 / fee-on-transfer handling that also applies here.
+    /// @param users Addresses to push dividends to. Get this list off-chain —
+    ///        the chain has no way to enumerate all taxToken holders. Passing
+    ///        a protected address (pair/dead/vault/taxToken) is harmless.
     function distributeTo(address[] calldata users) external nonReentrant {
         for (uint256 i = 0; i < users.length; i++) {
             try this.pushClaimFor(users[i]) {} catch {}
         }
     }
 
-    /// @dev External wrapper so distributeTo can try/catch per-user failures.
-    ///      Not meant to be called directly — use claimAll() or distributeTo().
     function pushClaimFor(address user) external {
         require(msg.sender == address(this), "internal only");
         _claimAllFor(user);
     }
 
     function _claimAllFor(address user) internal returns (bool claimedAny) {
-        syncShare(user);
+        _syncShare(user);
         for (uint256 i = 0; i < allRewardTokens.length; i++) {
             address token = allRewardTokens[i];
             uint256 owed = withdrawableDividendOf(user, token);
             if (owed == 0) continue;
 
-            withdrawnDividends[token][user] += owed;
-            bool ok = IERC20(token).transfer(user, owed);
-            require(ok, "transfer failed");
-            emit DividendClaimed(user, token, owed);
+            uint256 balBefore = IERC20(token).balanceOf(user);
+            IERC20(token).safeTransfer(user, owed);
+            uint256 actuallyReceived = IERC20(token).balanceOf(user) - balBefore;
+
+            withdrawnDividends[token][user] += actuallyReceived;
+            totalClaimed[token] += actuallyReceived;
+            emit DividendClaimed(user, token, actuallyReceived);
             claimedAny = true;
         }
     }
 
     // ------------------------------------------------------------------
-    // Guardian-gated admin controls
+    // Admin controls
     // ------------------------------------------------------------------
     function setExcludedFromDividends(address account, bool excluded) external onlyRole(OPERATOR_ROLE) {
         excludedFromDividends[account] = excluded;
+        if (excluded) {
+            _applyShareChange(account, 0);
+        }
+        emit Excluded(account, excluded);
     }
 
-    function emergencyWithdrawToken(address token, uint256 amount, address to) external onlyRole(OPERATOR_ROLE) {
-        bool ok = IERC20(token).transfer(to, amount);
-        require(ok, "transfer failed");
+    function emergencyWithdrawToken(address token, uint256 amount, address to) external onlyGuardian {
+        uint256 balance = IERC20(token).balanceOf(address(this));
+        uint256 reserved = totalDeposited[token] > totalClaimed[token] ? totalDeposited[token] - totalClaimed[token] : 0;
+        uint256 available = balance > reserved ? balance - reserved : 0;
+        require(amount <= available, "amount exceeds surplus; would touch reserved dividends");
+
+        IERC20(token).safeTransfer(to, amount);
+        emit EmergencyWithdraw(token, amount, to);
     }
 
-    function emergencyWithdrawNative(uint256 amount, address to) external onlyRole(OPERATOR_ROLE) {
+    function emergencyWithdrawNative(uint256 amount, address to) external onlyGuardian {
+        uint256 pending = pendingBnbNoBasket;
+        for (uint256 i = 0; i < allRewardTokens.length; i++) {
+            pending += pendingBnbByToken[allRewardTokens[i]];
+        }
+        uint256 available = address(this).balance > pending ? address(this).balance - pending : 0;
+        require(amount <= available, "amount exceeds surplus; would touch pending dividend revenue");
+
         (bool ok,) = to.call{value: amount}("");
         require(ok, "withdraw failed");
+        emit EmergencyWithdraw(address(0), amount, to);
     }
 
     // ------------------------------------------------------------------
-    // VaultBase / VaultBaseV2 required overrides
+    // VaultBase / VaultBaseV2 / VaultBaseV3 required overrides
     // ------------------------------------------------------------------
     function description() public pure override returns (string memory) {
         return "Meme index vault: buys back a team-curated basket of up to 5 tokens with tax revenue and pays holders in all of them.";
@@ -388,8 +670,11 @@ contract IndexBasketVaultFactory is VaultFactoryBaseV2 {
         pancakeRouter = _pancakeRouter;
     }
 
-    /// @dev vaultData = abi.encode(address teamOperator, uint256 minimumShareBalance)
-    ///      Initial basket is empty — team calls updateBasket() right after launch.
+    /// @dev vaultData = abi.encode(address teamOperator, uint256 minimumShareBalance,
+    ///      address[] initialTokens, uint16[] initialWeights). Pass empty
+    ///      arrays for initialTokens/initialWeights to launch with no basket
+    ///      (team must then call updateBasket() separately) — but setting it
+    ///      here avoids the empty-basket window entirely (IBV-03).
     function newVault(address taxToken, address quoteToken, address, /* creator */ bytes calldata vaultData)
         external
         override
@@ -398,10 +683,11 @@ contract IndexBasketVaultFactory is VaultFactoryBaseV2 {
         require(msg.sender == _getVaultPortal(), "Only VaultPortal");
         require(quoteToken == address(0), "Only native BNB quote token supported");
 
-        (address teamOperator, uint256 minimumShareBalance) = abi.decode(vaultData, (address, uint256));
+        (address teamOperator, uint256 minimumShareBalance, address[] memory initialTokens, uint16[] memory initialWeights)
+        = abi.decode(vaultData, (address, uint256, address[], uint16[]));
 
         IndexBasketVault v = new IndexBasketVault();
-        v.initializeVault(taxToken, pancakeRouter, teamOperator, minimumShareBalance);
+        v.initializeVault(taxToken, pancakeRouter, teamOperator, minimumShareBalance, initialTokens, initialWeights);
         vault = address(v);
     }
 
@@ -409,12 +695,20 @@ contract IndexBasketVaultFactory is VaultFactoryBaseV2 {
         supported = quoteToken == address(0);
     }
 
+    /// @dev BOTH-11: v2.3 so the VaultPortal applies the V3 validation flow
+    ///      that matches our vault's `VaultBaseV3` inheritance.
+    function factorySpecVersion() public pure override returns (string memory) {
+        return "v2.3";
+    }
+
     function vaultDataSchema() public pure override returns (VaultDataSchema memory schema) {
         schema.description =
             "Creates an index-basket vault: pays holders dividends in a team-curated basket of up to 5 tokens.";
-        schema.fields = new FieldDescriptor[](2);
+        schema.fields = new FieldDescriptor[](4);
         schema.fields[0] = FieldDescriptor("teamOperator", "address", "Address allowed to update the basket", 0);
         schema.fields[1] = FieldDescriptor("minimumShareBalance", "uint256", "Minimum token balance to be eligible for dividends", 18);
+        schema.fields[2] = FieldDescriptor("initialTokens", "address", "Optional initial basket tokens (up to 5)", 0);
+        schema.fields[3] = FieldDescriptor("initialWeights", "uint16", "Matching weights in basis points, summing to 10000", 0);
         schema.isArray = false;
     }
 }

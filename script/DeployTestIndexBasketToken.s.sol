@@ -90,7 +90,7 @@ contract DeployTestIndexBasketToken is Script {
         params.commissionReceiver = address(0);
         params.tokenVersion = IPortalTypes.TokenVersion.TOKEN_TAXED_V3;
         params.vaultFactory = VAULT_FACTORY;
-        params.vaultData = abi.encode(msg.sender, uint256(1));
+        params.vaultData = abi.encode(msg.sender, uint256(1), new address[](0), new uint16[](0)); // no initial basket - set via updateBasket() below (IBV-03 ABI change)
     }
 
     function _findVaultAddress(address token) internal view returns (address vaultAddr) {
@@ -124,6 +124,15 @@ contract DeployTestIndexBasketToken is Script {
         IndexBasketVault vault = IndexBasketVault(payable(vaultAddr));
 
         vault.syncShare(me);
+
+        // Revenue that arrived via dispatch() before `me` was synced gets
+        // parked as native BNB rather than lost — see the earlier bugfix.
+        // Now that `me` is known, unstick it.
+        if (address(vaultAddr).balance > 0) {
+            vault.processPendingRevenue();
+            console2.log("Unstuck parked BNB via processPendingRevenue().");
+        }
+
         uint256 pendingCake = vault.withdrawableDividendOf(me, CAKE_TESTNET);
         uint256 pendingBusd = vault.withdrawableDividendOf(me, BUSD_TESTNET);
         console2.log("Pending CAKE:", pendingCake);

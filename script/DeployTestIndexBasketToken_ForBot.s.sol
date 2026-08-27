@@ -22,7 +22,7 @@ contract DeployTestIndexBasketTokenForBot is Script {
     address internal constant PORTAL_TESTNET = 0x5bEacaF7ABCbB3aB280e80D007FD31fcE26510e9;
     address internal constant TAX_TOKEN_V3_IMPL_TESTNET = 0xE6Ff967a887084c16D0fD71548CF709542cc1557;
 
-    address internal constant VAULT_FACTORY = 0xaaE5bd958BEa8e086B6a63B67966314EF54EeaBA;
+    address internal constant VAULT_FACTORY = 0xcEA20B825dc51eB9cc6c0814da55EF42ca215985;
 
     address internal constant CAKE_TESTNET = 0xFa60D973F7642B748046464e165A65B7323b0DEE;
     address internal constant BUSD_TESTNET = 0xeD24FC36d5Ee211Ea25A80239Fb8C4Cfd80f12Ee;
@@ -101,7 +101,7 @@ contract DeployTestIndexBasketTokenForBot is Script {
         params.commissionReceiver = address(0);
         params.tokenVersion = IPortalTypes.TokenVersion.TOKEN_TAXED_V3;
         params.vaultFactory = VAULT_FACTORY;
-        params.vaultData = abi.encode(msg.sender, uint256(1));
+        params.vaultData = abi.encode(msg.sender, uint256(1), new address[](0), new uint16[](0)); // no initial basket - set via updateBasket() below (IBV-03 ABI change)
     }
 
     function _findVaultAddress(address token) internal view returns (address vaultAddr) {
@@ -116,9 +116,9 @@ contract DeployTestIndexBasketTokenForBot is Script {
     function _splitAndSync(address token, address vaultAddr, address me) internal {
         uint256 tenPercent = IERC20(token).balanceOf(me) / 10;
 
-        IERC20(token).transfer(HOLDER2, tenPercent * 3);
-        IERC20(token).transfer(HOLDER3, tenPercent * 2);
-        IERC20(token).transfer(HOLDER4, tenPercent * 1);
+        require(IERC20(token).transfer(HOLDER2, tenPercent * 3), "transfer to HOLDER2 failed");
+        require(IERC20(token).transfer(HOLDER3, tenPercent * 2), "transfer to HOLDER3 failed");
+        require(IERC20(token).transfer(HOLDER4, tenPercent * 1), "transfer to HOLDER4 failed");
 
         IndexBasketVault vault = IndexBasketVault(payable(vaultAddr));
         vault.syncShare(me);

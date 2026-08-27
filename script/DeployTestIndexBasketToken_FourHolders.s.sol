@@ -100,7 +100,7 @@ contract DeployTestIndexBasketTokenFourHolders is Script {
         params.commissionReceiver = address(0);
         params.tokenVersion = IPortalTypes.TokenVersion.TOKEN_TAXED_V3;
         params.vaultFactory = VAULT_FACTORY;
-        params.vaultData = abi.encode(msg.sender, uint256(1));
+        params.vaultData = abi.encode(msg.sender, uint256(1), new address[](0), new uint16[](0)); // no initial basket - set via updateBasket() below (IBV-03 ABI change)
     }
 
     function _findVaultAddress(address token) internal view returns (address vaultAddr) {
@@ -115,9 +115,9 @@ contract DeployTestIndexBasketTokenFourHolders is Script {
     function _splitAndSync(address token, address vaultAddr, address me) internal {
         uint256 tenPercent = IERC20(token).balanceOf(me) / 10;
 
-        IERC20(token).transfer(HOLDER2, tenPercent * 3);
-        IERC20(token).transfer(HOLDER3, tenPercent * 2);
-        IERC20(token).transfer(HOLDER4, tenPercent * 1);
+        require(IERC20(token).transfer(HOLDER2, tenPercent * 3), "transfer to HOLDER2 failed");
+        require(IERC20(token).transfer(HOLDER3, tenPercent * 2), "transfer to HOLDER3 failed");
+        require(IERC20(token).transfer(HOLDER4, tenPercent * 1), "transfer to HOLDER4 failed");
 
         IndexBasketVault vault = IndexBasketVault(payable(vaultAddr));
         vault.syncShare(me);

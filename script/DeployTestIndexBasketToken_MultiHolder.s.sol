@@ -97,7 +97,7 @@ contract DeployTestIndexBasketTokenMultiHolder is Script {
         params.commissionReceiver = address(0);
         params.tokenVersion = IPortalTypes.TokenVersion.TOKEN_TAXED_V3;
         params.vaultFactory = VAULT_FACTORY;
-        params.vaultData = abi.encode(msg.sender, uint256(1));
+        params.vaultData = abi.encode(msg.sender, uint256(1), new address[](0), new uint16[](0)); // no initial basket - set via updateBasket() below (IBV-03 ABI change)
     }
 
     function _findVaultAddress(address token) internal view returns (address vaultAddr) {
@@ -116,7 +116,7 @@ contract DeployTestIndexBasketTokenMultiHolder is Script {
         uint256 fullBalance = IERC20(token).balanceOf(me);
         uint256 half = fullBalance / 2;
 
-        IERC20(token).transfer(HOLDER2, half);
+        require(IERC20(token).transfer(HOLDER2, half), "transfer to HOLDER2 failed");
         console2.log("Transferred half to HOLDER2:", half);
 
         vault.syncShare(me);
