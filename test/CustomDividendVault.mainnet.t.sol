@@ -77,6 +77,7 @@ contract CustomDividendVaultTest is Test {
         assertEq(vault.dividendToken(), CAKE, "dividendToken mismatch");
         assertEq(vault.pancakeRouter(), PANCAKE_ROUTER_V2, "router mismatch");
         assertEq(vault.vaultQuoteToken(), address(0), "native-only vault");
+        assertEq(vault.minBnbToProcess(), 0.03 ether);
     }
 
     function test_factorySpecVersionIsV23() public view {

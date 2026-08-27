@@ -80,7 +80,7 @@ contract CustomDividendVault is VaultBaseV3, AccessControl, ReentrancyGuard {
     uint256 public totalEligibleSupply;
 
     uint256 public pendingBnb;
-    uint256 public minBnbToProcess;
+    uint256 public minBnbToProcess = 0.03 ether; // skip dust swaps
     uint16 public maxSlippageBps = 500;
     uint16 public maxReserveImpactBps = 200;
 

@@ -120,7 +120,7 @@ contract IndexBasketVault is VaultBaseV3, AccessControl, ReentrancyGuard {
     ///         token's share on a later processing round.
     mapping(address => uint256) public pendingBnbByToken;
 
-    uint256 public minBnbToProcess;
+    uint256 public minBnbToProcess = 0.03 ether; // per basket slot; skip dust swaps
     uint16 public maxSlippageBps = 500; // 5% default
     uint16 public maxReserveImpactBps = 200; // 2% of WBNB pair reserve per swap, default
 

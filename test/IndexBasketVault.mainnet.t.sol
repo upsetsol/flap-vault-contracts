@@ -99,6 +99,7 @@ contract IndexBasketVaultTest is Test {
         assertEq(vault.pancakeRouter(), PANCAKE_ROUTER_V2);
         assertTrue(vault.hasRole(vault.OPERATOR_ROLE(), TEAM_OPERATOR));
         assertEq(vault.vaultQuoteToken(), address(0), "native-only vault");
+        assertEq(vault.minBnbToProcess(), 0.03 ether);
     }
 
     function test_factoryRejectsNonVaultPortalCaller() public {
