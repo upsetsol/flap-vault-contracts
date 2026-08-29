@@ -48,20 +48,8 @@ interface ITaxTokenMainPool {
 /// @dev Guardian address is NOT a constructor parameter — it is resolved on
 ///      every call via `_getGuardian()` from VaultBase, which returns Flap's
 ///      own security-team address per chain.
-/// @dev SECURITY NOTE (post-review, see flap-vault-contracts-security-review.md):
-///      Pass 1 fixes (Critical/High): receive()-only-accumulates (BOTH-01,
-///      CDV-01), slippage floor + reserve cap + threshold (BOTH-02, BOTH-07),
-///      Guardian-only emergency with reserved-balance protection (BOTH-10),
-///      hard-excluded protected addresses (BOTH-03, BOTH-04, BOTH-12).
-///      Pass 2 fixes (this revision):
-///        - BOTH-09: SafeERC20 for all payouts, plus balance-delta
-///          measurement so a fee-on-transfer dividend token can no longer
-///          create a silent accounting/balance mismatch.
-///        - BOTH-11 (partial): now extends `VaultBaseV3`, declares
-///          `vaultQuoteToken() == address(0)` (native); factory advertises
-///          `factorySpecVersion() == "v2.3"`.
-///      IBV-02/IBV-03 don't apply here — this vault has a single, fixed
-///      dividendToken set once at construction, not a mutable basket.
+/// @dev Native BNB in, one dividend token out. `receive()` only queues BNB;
+///      swaps run in `processPendingRevenue`. `dividendToken` is set once.
 contract CustomDividendVault is VaultBaseV3, AccessControl, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
@@ -191,7 +179,7 @@ contract CustomDividendVault is VaultBaseV3, AccessControl, ReentrancyGuard {
     }
 
     // ------------------------------------------------------------------
-    // Receives tax revenue — accumulates ONLY, never swaps here (BOTH-01)
+    // Tax BNB: queue only. No swaps here.
     // ------------------------------------------------------------------
     receive() external payable nonReentrant {
         pendingBnb += msg.value;
@@ -336,9 +324,7 @@ contract CustomDividendVault is VaultBaseV3, AccessControl, ReentrancyGuard {
         return accumulative - withdrawnDividends[user];
     }
 
-    /// @notice SECURITY FIX (BOTH-09): SafeERC20 + balance-delta measurement
-    ///         so a fee-on-transfer dividendToken can't create a silent
-    ///         accounting/balance mismatch.
+    /// @notice Claim pending dividends. Uses SafeERC20 and the amount actually received.
     function claim() external nonReentrant {
         _syncShare(msg.sender);
 
@@ -461,7 +447,7 @@ contract CustomDividendVaultFactory is VaultFactoryBaseV2 {
         supported = quoteToken == address(0);
     }
 
-    /// @dev BOTH-11: v2.3 so the VaultPortal applies the V3 validation flow.
+    /// @dev VaultPortal V3 validation; must match `VaultBaseV3`.
     function factorySpecVersion() public pure override returns (string memory) {
         return "v2.3";
     }

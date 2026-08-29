@@ -56,50 +56,11 @@ interface IFlapQuotedToken {
 ///         team (OPERATOR_ROLE) — this contract does not attempt on-chain
 ///         "top runners" discovery or rug-filtering, since that judgment
 ///         cannot be done reliably on-chain.
-/// @dev SECURITY NOTE (post-review, see flap-vault-contracts-security-review.md):
-///      Pass 1 fixes (Critical/High): receive()-only-accumulates (BOTH-01,
-///      IBV-04), slippage floor + reserve cap + threshold (BOTH-02, BOTH-07),
-///      Guardian-only emergency with reserved-balance protection (IBV-01,
-///      BOTH-10), hard-excluded protected addresses (BOTH-03, BOTH-04, BOTH-12).
-///      Pass 2 fixes (this revision):
-///        - IBV-03: basket can be set atomically at construction via
-///          `vaultData`, and `updateBasket` now enforces a minimum cooldown —
-///          no more "empty basket, then delayed dump into whatever the team
-///          picks" launch-window pattern.
-///        - IBV-02: pending BNB is tracked PER BASKET TOKEN
-///          (`pendingBnbByToken`), computed at receive() time using the
-///          weights in effect then. A token that fails to swap keeps its own
-///          isolated leftover — it no longer bleeds into other tokens'
-///          weights on the next processing round.
-///        - BOTH-09: all token payouts use OpenZeppelin `SafeERC20` (handles
-///          tokens that don't return a bool) and measure the ACTUAL amount
-///          received via balance delta rather than trusting the requested
-///          amount — a fee-on-transfer reward token can no longer cause a
-///          silent accounting/balance mismatch.
-///        - BOTH-11 (partial): now extends `VaultBaseV3` and declares
-///          `vaultQuoteToken() == address(0)` (native); factory advertises
-///          `factorySpecVersion() == "v2.3"`. Custom-error-vs-require-string
-///          (Flap UI-01) and `autoForwardEnabled`/`forwardAddress` are NOT
-///          addressed in this revision — tracked separately.
-///      Follow-up: required initial basket; extra LP exclusion; fail-closed
-///      skip when no pair (BNB is not spent); pending BNB of dropped basket
-///      tokens is not locked; operator knobs cannot lock processing; slippage
-///      ceiling is 5% (basket swap only). Reserve-impact cap is opt-in
-///      (`maxReserveImpactBps == 0` default) so thin Flap quote pools are not sliced.
-///      Basket buys use Pancake V2: WBNB → token when that pair exists, otherwise
-///      WBNB → quote → token. Quote is auto-read from Flap `quoteToken()` / `mainPool`,
-///      or set by the operator via `setBasketQuote`. Two hops still use native BNB
-///      revenue; this is not an ERC20 vault quote.
-/// @dev Share sync model: a holder's share is refreshed to their current
-///      taxToken balance at claim()/sync time, not on every transfer — this
-///      vault cannot hook taxToken transfers (BOTH-05). Dividends are NOT a
-///      live pro-rata snapshot; they lag behind actual holding changes until
-///      someone triggers a sync (self-claim, a keeper's distributeTo(), or an
-///      explicit syncShare() call). Run a keeper (see the companion
-///      dividend-bot) that periodically calls distributeTo() with the current
-///      holder list to keep this current in practice.
-///      Changing the basket does NOT liquidate previously-acquired reward
-///      tokens; past accruals remain claimable in their original denomination.
+/// @dev Native BNB in, basket tokens out. `receive()` only queues BNB;
+///      swaps run in `processPendingRevenue`. Shares update on claim/sync,
+///      not on every taxToken transfer. Changing the basket does not
+///      liquidate already-bought reward tokens. Pancake V2: WBNB → token
+///      when that pair exists, otherwise WBNB → quote → token.
 contract IndexBasketVault is VaultBaseV3, AccessControl, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
@@ -127,9 +88,8 @@ contract IndexBasketVault is VaultBaseV3, AccessControl, ReentrancyGuard {
     ///         arrived).
     uint256 public pendingBnbNoBasket;
     /// @notice BNB queued per basket token, allocated at receive() time using
-    ///         the weights in effect then (IBV-02) — isolated per token so a
-    ///         dead/failing token's leftover never bleeds into another
-    ///         token's share on a later processing round.
+    ///         the weights in effect then. Isolated per token so a failed
+    ///         swap leftover does not mix into another token's share.
     mapping(address => uint256) public pendingBnbByToken;
 
     uint256 public minBnbToProcess = 0.03 ether; // per basket slot; skip dust swaps
@@ -218,9 +178,7 @@ contract IndexBasketVault is VaultBaseV3, AccessControl, ReentrancyGuard {
         address guardian = _getGuardian();
         _grantRole(DEFAULT_ADMIN_ROLE, guardian);
         _grantRole(OPERATOR_ROLE, guardian);
-        // SECURITY FIX (IBV-01): team gets OPERATOR_ROLE only — never
-        // DEFAULT_ADMIN_ROLE — and emergency withdrawals are gated by
-        // onlyGuardian, not OPERATOR_ROLE, so this can't be used to drain.
+        // Team is operator only. Emergency withdraw is Guardian-gated.
         if (_teamOperator != address(0)) {
             _grantRole(OPERATOR_ROLE, _teamOperator);
         }
@@ -245,13 +203,11 @@ contract IndexBasketVault is VaultBaseV3, AccessControl, ReentrancyGuard {
 
     /// @notice Replace the current basket. Does not touch previously-acquired
     ///         reward tokens — those stay claimable at their old accrual rate.
-    ///         SECURITY FIX (IBV-03): rate-limited by `basketUpdateCooldown`
-    ///         so the team cannot rapidly swap the basket right after launch
-    ///         (or at any other moment) faster than holders can notice.
+    ///         Rate-limited by `basketUpdateCooldown`.
     /// @param tokens Up to 5 token addresses, no duplicates, no zero address,
-    ///        and none of {taxToken, this vault, the router, WBNB} (IBV-04).
+    ///        and none of {taxToken, this vault, the router, WBNB}.
     /// @param weightsBps Matching weights in basis points; must sum to 10000,
-    ///        and every individual weight must be > 0 (IBV-07).
+    ///        and every individual weight must be > 0.
     function updateBasket(address[] calldata tokens, uint16[] calldata weightsBps) external onlyRole(OPERATOR_ROLE) {
         // forge-lint: disable-next-line(block-timestamp)
         // Validators can nudge block.timestamp by a few seconds; irrelevant
@@ -400,10 +356,7 @@ contract IndexBasketVault is VaultBaseV3, AccessControl, ReentrancyGuard {
     }
 
     // ------------------------------------------------------------------
-    // Receives tax revenue — accumulates ONLY, never swaps here (BOTH-01).
-    // Per Flap VaultBaseV3's ping contract: keep this lightweight (storage
-    // writes only, no external calls) so a heavy vault never makes the
-    // protocol's keeper's dispatch fail for this token.
+    // Tax BNB: queue only. No swaps here — keep receive() cheap for Flap.
     // ------------------------------------------------------------------
     receive() external payable nonReentrant {
         if (basketTokens.length == 0) {
@@ -460,8 +413,7 @@ contract IndexBasketVault is VaultBaseV3, AccessControl, ReentrancyGuard {
             uint256 processed = _swapAndDeposit(token, amount);
             uint256 leftover = amount - processed;
             if (leftover > 0) {
-                // SECURITY FIX (IBV-02): stays isolated to THIS token's own
-                // bucket — never re-mixed into other tokens' weights.
+                // Leftover stays on this token's queue, not re-split.
                 pendingBnbByToken[token] += leftover;
             }
             processedAny = true;
@@ -689,12 +641,7 @@ contract IndexBasketVault is VaultBaseV3, AccessControl, ReentrancyGuard {
     }
 
     /// @notice Claim pending dividends in a single reward token.
-    ///         SECURITY FIX (BOTH-09): uses SafeERC20 (survives tokens that
-    ///         don't return a bool) and measures the ACTUAL amount received
-    ///         via balance delta — a fee-on-transfer reward token can no
-    ///         longer create a silent gap between "accounted as paid" and
-    ///         "actually delivered". Under-delivered amounts simply remain
-    ///         claimable for next time.
+    ///         Uses SafeERC20 and credits the amount actually received.
     function claimToken(address token) public nonReentrant {
         _syncShare(msg.sender);
         uint256 owed = withdrawableDividendOf(msg.sender, token);
@@ -948,8 +895,7 @@ contract IndexBasketVaultFactory is VaultFactoryBaseV2 {
         supported = quoteToken == address(0);
     }
 
-    /// @dev BOTH-11: v2.3 so the VaultPortal applies the V3 validation flow
-    ///      that matches our vault's `VaultBaseV3` inheritance.
+    /// @dev VaultPortal V3 validation; must match `VaultBaseV3`.
     function factorySpecVersion() public pure override returns (string memory) {
         return "v2.3";
     }
